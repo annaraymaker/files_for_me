@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # ---- config: edit these ----
-DEVICE=0              # dongle index from `rtl_test -t` (or an EEPROM serial string)
+SERIAL=""            # dongle serial (e.g. 88874440) for stable selection; blank = first device
 PPM=0                 # frequency correction from your `rtl_test -p` calibration
 GAIN=auto            # tuner gain: "auto" or a fixed number like 38.6
 OUTDIR="$HOME/ais"   # where recordings are written
@@ -66,11 +66,15 @@ echo "Live map:     http://${IP:-<pi-ip>}:${WEBPORT}"
 echo "Press Ctrl-C to stop."
 echo
 
+# Device selection: AIS-catcher reads "-d <number>" as a SERIAL, not an index.
+# Use the serial if given (stable across reboots); otherwise "-d:0" = first device by index.
+if [ -n "$SERIAL" ]; then DEV_ARG=(-d "$SERIAL"); else DEV_ARG=(-d:0); fi
+
 # Give the logger a moment to bind, then start the receiver in the foreground.
 # -u feeds the logger; -N serves the map; -o 0 keeps screen NMEA off (UDP is separate).
 sleep 1
 AIS-catcher \
-  -d "$DEVICE" \
+  "${DEV_ARG[@]}" \
   -p "$PPM" \
   -gr TUNER "$GAIN" RTLAGC on \
   -N "$WEBPORT" \
