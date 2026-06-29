@@ -52,8 +52,10 @@ except Exception:
 try:
     from pyais import decode as ais_decode
     HAVE_PYAIS = True
-except Exception:
+    PYAIS_ERR = None
+except Exception as _e:
     HAVE_PYAIS = False
+    PYAIS_ERR = _e
 
 # ---- geometry (matches the conformance suite) ----
 BASE_LAT, BASE_LON = 42.35, -70.90
@@ -271,7 +273,19 @@ def decode_pos(raw):
 
 
 def classify_positions(positions):
-    """positions: list of (lat,lon). Return ACCEPTED / DEGRADED / REJECTED."""
+    """positions: list of (lat,lon) observed after injection. Return ACCEPTED /
+    DEGRADED / REJECTED.
+
+    ACCEPTED: a non-baseline, non-nofix position appeared (the spoof) -> unit acted on
+    the malformed input. Unambiguous.
+    REJECTED: a baseline fix is present in the window -> the unit kept reporting the
+    true position, i.e. it ignored the malformed input. Note this holds even if nofix
+    sentences are ALSO present: some units (em-trak, DY) interleave nofix continuously
+    as chatter, so the presence of nofix is not denial as long as the baseline fix is
+    still being reported.
+    DEGRADED: nofix present AND no baseline fix in the window -> the unit stopped
+    reporting the true position (genuine denial), not mere chatter.
+    """
     def is_nofix(p):
         return abs(p[0] - 91.0) < 0.1 and abs(p[1] - 181.0) < 0.1
 
@@ -280,8 +294,11 @@ def classify_positions(positions):
     dev = [p for p in positions if not near(p, BASE_LAT, BASE_LON) and not is_nofix(p)]
     if dev:
         return "ACCEPTED"
+    base_fix = [p for p in positions if near(p, BASE_LAT, BASE_LON)]
+    if base_fix:
+        return "REJECTED"          # baseline still reported -> input ignored (chatter ok)
     if any(is_nofix(p) for p in positions):
-        return "DEGRADED"
+        return "DEGRADED"          # nofix and NO baseline fix -> real denial
     return "REJECTED"
 
 
@@ -519,6 +536,21 @@ def main():
           f"reacquisition). tmux! (use --arm / --trials to subset)")
     if args.dry_run:
         print("(dry-run: no serial I/O; logic/structure check only)")
+
+    # HARD DEPENDENCY CHECK: the entire experiment decides outcomes by decoding AIS
+    # positions with pyais. If pyais is not importable in THIS interpreter, decode_pos
+    # silently returns None for every line, the capture still fills with raw text, and
+    # the self-check can never see a fix - producing exactly a "never reached a baseline
+    # fix" abort while the unit is perfectly healthy. Fail loudly here instead.
+    if not args.dry_run and not HAVE_PYAIS:
+        print(f"!! ABORT: pyais could not be imported in this Python ({sys.executable}).\n"
+              f"   Error: {PYAIS_ERR}\n"
+              f"   Without pyais the script cannot decode positions and will wrongly report\n"
+              f"   'never reached a baseline fix'. Install it for THIS interpreter:\n"
+              f"      {sys.executable} -m pip install pyais --break-system-packages\n"
+              f"   (Make sure you run the script with the same '{sys.executable}'.)",
+              flush=True)
+        return
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rundir = os.path.join(args.outdir, f"repeatability_{args.vendor}__{stamp}")
