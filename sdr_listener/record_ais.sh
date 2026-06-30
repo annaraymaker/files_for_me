@@ -144,6 +144,7 @@ while [ "$_cleaned" = 0 ]; do
     -N "$WEBPORT" \
     -u 127.0.0.1 "$UDPPORT" \
     -o 0 \
+    -X off \
     -v "$STATS" \
     2>>"$LOGFILE"
   rc=$?
