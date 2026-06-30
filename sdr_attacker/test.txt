@@ -1,0 +1,117 @@
+(venv) g53-dote@listener:~/ais $ bash ./record_ais.sh
+2026-06-30T15:29:18Z Recording NMEA -> /home/g53-dote/ais/ais_20260630T152917Z.nmea
+2026-06-30T15:29:18Z Diagnostics    -> /home/g53-dote/ais/ais_20260630T152917Z.log
+2026-06-30T15:29:18Z Live map       -> http://192.168.50.10:8100
+2026-06-30T15:29:18Z Gain=40.2 AGC=off PPM=0   Heartbeat every 10s in the .log
+2026-06-30T15:29:18Z Press Ctrl-C to stop.
+2026-06-30T15:29:18Z starting AIS-catcher (attempt 1)
+^C^C^C^C^C2026-06-30T15:29:55Z AIS-catcher exited (rc=0); restarting in 2s
+^C2026-06-30T15:29:55Z Stopped. Recorded 0 NMEA lines to /home/g53-dote/ais/ais_20260630T152917Z.nmea
+2026-06-30T15:29:55Z Diagnostics: /home/g53-dote/ais/ais_20260630T152917Z.log   Config: /home/g53-dote/ais/ais_20260630T152917Z.meta
+
+(venv) g53-dote@listener:~/ais $ ^C
+(venv) g53-dote@listener:~/ais $ ^C
+(venv) g53-dote@listener:~/ais $ ^C
+(venv) g53-dote@listener:~/ais $ ^C
+(venv) g53-dote@listener:~/ais $ nano ais_20260630T152917Z.nmea 
+(venv) g53-dote@listener:~/ais $ ^C
+(venv) g53-dote@listener:~/ais $ 
+
+
+
+(venv) g53-dote@attacker:~/Documents $ python3 rf_tx.py --iq known.cs8 --channel B --count 5 --gap 2
+about to transmit:
+  file       : known.cs8 (110848 bytes)
+  channel    : B  (162.025 MHz)
+  sample rate: 2000000 (MUST equal the file's generation rate)
+  tx gain    : 0 dB    amp: off
+  mode       : 5x
+
+====================================================================
+ TRANSMIT SAFETY CHECK
+ Transmitting AIS outside a sealed Faraday cage is illegal and a
+ navigation-safety hazard. There is no safe open-air power level.
+====================================================================
+ Type EXACTLY 'cage is sealed' to transmit (anything else aborts): cage is sealed
+logging to /home/g53-dote/ais_tx/tx_20260630T144210Z.jsonl
+  $ hackrf_transfer -t known.cs8 -f 162025000 -s 2000000 -x 0 -a 0
+call hackrf_set_sample_rate(2000000 Hz/2.000 MHz)
+call hackrf_set_hw_sync_mode(0)
+call hackrf_set_freq(162025000 Hz/162.025 MHz)
+call hackrf_set_amp_enable(0)
+Stop with Ctrl-C
+ 0.1 MiB / 0.037 sec =  3.0 MiB/second, average power -0.7 dBfs
+
+Exiting...
+Total time: 0.03664 s
+hackrf_stop_tx() done
+hackrf_close() done
+hackrf_exit() done
+fclose() done
+exit
+  sent 1/5 (rc=0)
+call hackrf_set_sample_rate(2000000 Hz/2.000 MHz)
+call hackrf_set_hw_sync_mode(0)
+call hackrf_set_freq(162025000 Hz/162.025 MHz)
+call hackrf_set_amp_enable(0)
+Stop with Ctrl-C
+ 0.1 MiB / 0.037 sec =  3.0 MiB/second, average power -0.7 dBfs
+
+Exiting...
+Total time: 0.03664 s
+hackrf_stop_tx() done
+hackrf_close() done
+hackrf_exit() done
+fclose() done
+exit
+  sent 2/5 (rc=0)
+call hackrf_set_sample_rate(2000000 Hz/2.000 MHz)
+call hackrf_set_hw_sync_mode(0)
+call hackrf_set_freq(162025000 Hz/162.025 MHz)
+call hackrf_set_amp_enable(0)
+Stop with Ctrl-C
+ 0.1 MiB / 0.037 sec =  3.0 MiB/second, average power -0.7 dBfs
+
+Exiting...
+Total time: 0.03664 s
+hackrf_stop_tx() done
+hackrf_close() done
+hackrf_exit() done
+fclose() done
+exit
+  sent 3/5 (rc=0)
+call hackrf_set_sample_rate(2000000 Hz/2.000 MHz)
+call hackrf_set_hw_sync_mode(0)
+call hackrf_set_freq(162025000 Hz/162.025 MHz)
+call hackrf_set_amp_enable(0)
+Stop with Ctrl-C
+ 0.1 MiB / 0.037 sec =  3.0 MiB/second, average power -0.7 dBfs
+
+Exiting...
+Total time: 0.03661 s
+hackrf_stop_tx() done
+hackrf_close() done
+hackrf_exit() done
+fclose() done
+exit
+  sent 4/5 (rc=0)
+call hackrf_set_sample_rate(2000000 Hz/2.000 MHz)
+call hackrf_set_hw_sync_mode(0)
+call hackrf_set_freq(162025000 Hz/162.025 MHz)
+call hackrf_set_amp_enable(0)
+Stop with Ctrl-C
+ 0.1 MiB / 0.037 sec =  3.0 MiB/second, average power -0.7 dBfs
+
+Exiting...
+Total time: 0.03664 s
+hackrf_stop_tx() done
+hackrf_close() done
+hackrf_exit() done
+fclose() done
+exit
+  sent 5/5 (rc=0)
+done. transmit log: /home/g53-dote/ais_tx/tx_20260630T144210Z.jsonl
+Match this log's timestamps against the listener's NMEA recording.
+(venv) g53-dote@attacker:~/Documents $ 
+
+
