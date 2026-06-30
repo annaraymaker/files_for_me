@@ -177,27 +177,33 @@ def _gaussian_taps(sps, bt=BT, span=4):
 
 
 def gmsk_modulate(nrzi_bits, sample_rate, bt=BT):
-    """NRZI bit string -> complex baseband IQ at sample_rate (GMSK)."""
+    """NRZI bit string -> complex baseband IQ at sample_rate (GMSK).
+
+    This matches GNU Radio's digital.gmsk_mod (the implementation the standard AIS-TX
+    tools use), which is what real AIS receivers are validated against:
+      1. map bits to NRZ +/-1 and REPEAT each symbol sps times (not an impulse train),
+      2. low-pass with a Gaussian filter (BT product, ~4*sps taps, normalized),
+      3. FM-modulate with sensitivity (pi*h)/sps, h=0.5 (MSK), i.e. integrate the
+         filtered signal to phase.
+    The earlier version filtered an impulse train instead of repeated symbols, which
+    produced the wrong pulse shape: a real FM discriminator could not recover the bits
+    even though deviation magnitude looked right. Repeating the symbols is the fix.
+    """
     sps = int(round(sample_rate / SYMBOL_RATE))
     if sps < 4:
         raise ValueError(f"sample_rate {sample_rate} too low for {SYMBOL_RATE} bps "
                          f"(need >= ~4 samples/symbol)")
-    # NRZ levels: 1 -> +1, 0 -> -1
+    h = 0.5                                   # MSK modulation index
+    sensitivity = (np.pi * h) / sps           # GNU Radio FM sensitivity
+    # NRZ symbols, each repeated across its symbol period
     nrz = np.array([1.0 if b == "1" else -1.0 for b in nrzi_bits])
-    # upsample to sps (rectangular), then Gaussian-shape
-    up = np.zeros(len(nrz) * sps)
-    up[::sps] = nrz
+    upsampled = np.repeat(nrz, sps)
+    # Gaussian pulse-shaping filter
     taps = _gaussian_taps(sps, bt)
-    shaped = np.convolve(up, taps, mode="same")
-    # Integrate to phase. AIS GMSK is MSK with modulation index h=0.5, i.e. each bit
-    # must advance the phase by exactly h*pi = pi/2 radians. The Gaussian taps sum to 1,
-    # so each symbol's shaped contribution sums to ~1 over its sps samples; multiplying
-    # the cumulative sum by (pi/2) therefore yields pi/2 of phase advance per bit, the
-    # correct deviation a real AIS receiver expects. (The earlier pi/sps scaling gave
-    # ~100x too little deviation and would not decode on a real receiver.)
-    phase = np.cumsum(shaped) * (np.pi / 2.0)
-    iq = np.exp(1j * phase).astype(np.complex64)
-    return iq
+    filtered = np.convolve(upsampled, taps, mode="same")
+    # FM-modulate: integrate the filtered signal to phase
+    phase = np.cumsum(filtered * sensitivity)
+    return np.exp(1j * phase).astype(np.complex64)
 
 
 def iq_to_hackrf_int8(iq):

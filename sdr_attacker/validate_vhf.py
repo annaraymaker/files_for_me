@@ -32,22 +32,24 @@ import ais_encode as enc
 # round-trip failure localizes a bug. The real receiver in the cage is AIS-catcher.
 # ----------------------------------------------------------------------------
 def gmsk_demod_bits(iq, sample_rate):
-    """Recover the NRZI line bits from GMSK IQ via differential phase detection."""
+    """Recover the NRZI line bits from GMSK IQ via FM discrimination - the same method
+    a real AIS receiver uses (differential phase between consecutive samples), so a pass
+    here means the signal is demodulable the way real hardware does it, not just
+    self-consistent with the encoder."""
     sps = int(round(sample_rate / enc.SYMBOL_RATE))
-    # instantaneous frequency = derivative of phase = which way the symbol went
-    phase = np.angle(iq)
-    dphase = np.diff(np.unwrap(phase))
-    # sample at symbol centers; find the burst (skip the zero pad) by energy
+    # FM discriminator: phase difference between consecutive samples
+    disc = np.angle(iq[1:] * np.conj(iq[:-1]))
+    # find the active burst (skip the zero pad) by magnitude
     mag = np.abs(iq)
-    active = np.where(mag > 0.5 * np.max(mag))[0]
+    active = np.where(mag > 0.4 * np.max(mag))[0]
     if len(active) == 0:
         return ""
     start, end = active[0], active[-1]
-    # decide bits at symbol centers within the active region
+    # sample the discriminator output at symbol centers
     bits = ""
     idx = start + sps // 2
-    while idx < end and idx < len(dphase):
-        bits += "1" if dphase[idx] > 0 else "0"
+    while idx < end and idx < len(disc):
+        bits += "1" if disc[idx] > 0 else "0"
         idx += sps
     return bits
 
