@@ -189,8 +189,13 @@ def gmsk_modulate(nrzi_bits, sample_rate, bt=BT):
     up[::sps] = nrz
     taps = _gaussian_taps(sps, bt)
     shaped = np.convolve(up, taps, mode="same")
-    # integrate to phase (MSK modulation index 0.5)
-    phase = np.cumsum(shaped) * (np.pi / sps)
+    # Integrate to phase. AIS GMSK is MSK with modulation index h=0.5, i.e. each bit
+    # must advance the phase by exactly h*pi = pi/2 radians. The Gaussian taps sum to 1,
+    # so each symbol's shaped contribution sums to ~1 over its sps samples; multiplying
+    # the cumulative sum by (pi/2) therefore yields pi/2 of phase advance per bit, the
+    # correct deviation a real AIS receiver expects. (The earlier pi/sps scaling gave
+    # ~100x too little deviation and would not decode on a real receiver.)
+    phase = np.cumsum(shaped) * (np.pi / 2.0)
     iq = np.exp(1j * phase).astype(np.complex64)
     return iq
 
