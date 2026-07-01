@@ -1,0 +1,29 @@
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -o WIFIDEV -j MASQUERADE
+sudo iptables -A FORWARD -i enx00XXXX -o WIFIDEV -j ACCEPT
+sudo iptables -A FORWARD -i WIFIDEV -o enx00XXXX -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+
+
+sudo apt update
+sudo apt install -y cmake autoconf libtool pkg-config build-essential \
+  python3-docutils libcppunit-dev swig doxygen python3-scipy \
+  gnuradio-dev gr-osmosdr libosmocore-dev libboost-all-dev \
+  libwebsocketpp-dev nlohmann-json3-dev
+pip install websocket-client numpy pyais --break-system-packages
+
+
+
+cd ~/ais-simulator-master/gr-ais_simulator
+mkdir build && cd build
+cmake ..
+make -j4
+sudo make install
+sudo ldconfig
+
+python3 -c "from gnuradio import ais_simulator; print('block OK')"
+
+
+sudo iptables -t nat -F POSTROUTING
+sudo iptables -F FORWARD
+sudo sysctl -w net.ipv4.ip_forward=0
