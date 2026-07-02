@@ -1,0 +1,42 @@
+venv) g53-dote@attacker:~/Documents $ python3 rf_session.py --gps-port /dev/ttyUSB0 --gps-baud 4800 --victim-mmsi 677777777 --lat 42.35 --lon -70.90 --gap 15 --phase2 --phase2-gap 30 --repeat 3
+Type EXACTLY 'cage is sealed' to run the session: cage is sealed
+Exception in thread Thread-1:
+GPS feeding victim @ 42.35,-70.9 on /dev/ttyUSB0
+settling 30.0s so the transponder gets a fix...
+Traceback (most recent call last):
+  File "/home/g53-dote/Documents/venv/lib/python3.13/site-packages/serial/serialposix.py", line 322, in open
+    self.fd = os.open(self.portstr, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+              ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/dev/ttyUSB0'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/threading.py", line 1043, in _bootstrap_inner
+    self.run()
+    ~~~~~~~~^^
+  File "/home/g53-dote/Documents/rf_session.py", line 74, in run
+    self.ser = serial.Serial(self.port, self.baud, timeout=1)
+               ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/g53-dote/Documents/venv/lib/python3.13/site-packages/serial/serialutil.py", line 244, in __init__
+    self.open()
+    ~~~~~~~~~^^
+  File "/home/g53-dote/Documents/venv/lib/python3.13/site-packages/serial/serialposix.py", line 325, in open
+    raise SerialException(msg.errno, "could not open port {}: {}".format(self._port, msg))
+serial.serialutil.SerialException: [Errno 2] could not open port /dev/ttyUSB0: [Errno 2] No such file or directory: '/dev/ttyUSB0'
+connecting to ws://127.0.0.1:52002/ws
+phase 1: 21 attacks, 15.0s apart, repeat 3x
+
+[P1:1/21] ghost_ship @ 14:50:54
+      -> ghost near victim
+      -> ghost near victim
+      -> ghost near victim
+[P1:2/21] impossible_jump @ 14:51:12
+      -> jump A at victim
+      -> jump B far
+      -> jump A at victim
+      -> jump B far
+      -> jump A at victim
+      -> jump B far
+
+
