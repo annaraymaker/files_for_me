@@ -1,59 +1,94 @@
-g53-dote@listener:~ $ AIS-catcher -d:0 -v 5
+g53-dote@listener:~/ais $ AIS-catcher -d:0 -gr TUNER 40.2 RTLAGC off -p 0 -o 0 -u 127.0.0.1 10110 -N 8100 -v 5
 AIS-catcher (build Jun 27 2026) v0.70-3417-g48289445
 (C) Copyright 2021-2026 jvde-github and other contributors
 This is free software; see the source for copying conditions. There is NO
 warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-Searching for device with SN 88873440 and type RTLSDR.
-Found Rafael Micro R820T tuner
-Device    : NESDR SMArt v5
-Settings  : rate 1536K format CU8 tuner AUTO rtlagc ON biastee OFF buffer_count 24
-Model #0-0 -> (Src: 1, Grp: 1): [AIS engine v0.70] channel AB ps_ema ON afc_wide ON droop ON fp_ds OFF dsk OFF 
-cb transfer status: 1, canceling...
-RTLSDR: lost device. Terminating.
-----------------------
-[AIS engine v0.70 #0-0]                 total: 0 msgs
-
-g53-dote@listener:~ $ AIS-catcher -d:0 -v 5
-AIS-catcher (build Jun 27 2026) v0.70-3417-g48289445
-(C) Copyright 2021-2026 jvde-github and other contributors
-This is free software; see the source for copying conditions. There is NO
-warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-Searching for device with SN 88873440 and type RTLSDR.
-Found Rafael Micro R820T tuner
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-r82xx_write: i2c wr failed=-1 reg=05 len=7
-r82xx_write: i2c wr failed=-1 reg=0c len=1
-r82xx_init: failed=-1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-r82xx_write: i2c wr failed=-1 reg=1a len=1
-r82xx_set_freq: failed=-1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-RTLSDR: cannot set frequency.
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
-rtlsdr_demod_write_reg failed with -1
-rtlsdr_demod_read_reg failed with -1
+Hint: Use '-X on' to share with aiscatcher.org community (enables community overlay) or '-X off' to disable. Currently ON by default.
 rtlsdr_write_reg failed with -1
-g53-dote@listener:~ $ AIS-catcher -d:0 -v 5
-Device Manager: device does not exist
-g53-dote@listener:~ $ AIS-catcher -d:0 -v 5
-Device Manager: device does not exist
-g53-dote@listener:~ $ AIS-catcher -d:0 -v 5
-Device Manager: device does not exist
-g53-dote@listener:~ $ AIS-catcher -d:0 -v 5
-Device Manager: device does not exist
-g53-dote@listener:~ $ 
+Resetting device...
+rtlsdr_write_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_read_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_read_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_read_reg failed with -4
+rtlsdr_write_reg failed with -4
+rtlsdr_read_reg failed with -4
+rtlsdr_write_reg failed with -4
+No supported tuner found
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+Enabled direct sampling mode, input 1
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+UDP: open socket for host: 127.0.0.1, port: 10110, msgformat: NMEA, sources: ALL
+TCP feed: open socket for host: 185.77.96.227, port: 4242, persist: ON, keep_alive: ON, reset: 180, msgformat: COMMUNITY_HUB, gps OFF, own_interval 10, sources: 1, status: connected
 
+HTML Server running at port 8100
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+rtlsdr_demod_write_reg failed with -4
+rtlsdr_demod_read_reg failed with -4
+RTLSDR: cannot set frequency.
+rtlsdr_write_reg failed with -4
+g53-dote@listener:~/ais $ 
