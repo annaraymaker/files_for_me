@@ -11,8 +11,8 @@ SERIAL=""            # HackRF serial for stable selection; blank = first device.
 LNA_GAIN=16          # HackRF LNA (IF) gain: 0-40 in steps of 8. Keep LOW for the
                      # close-range cage to avoid front-end overload.
 VGA_GAIN=20          # HackRF VGA (baseband) gain: 0-62 in steps of 2. Keep LOW.
-AMP="off"            # HackRF RF amp (extra +14 dB). OFF at close range; you have
-                     # plenty of signal and the amp will overload the receiver.
+PREAMP="off"         # HackRF preamplifier (extra gain). OFF at close range; you have
+                     # plenty of signal and the preamp will overload the receiver.
 CHANNELS="AB"        # AIS channel pair: AB = 161.975/162.025 MHz (standard).
 OUTDIR="$HOME/ais"   # where recordings are written
 WEBPORT=8100         # live map at http://<pi-ip>:WEBPORT
@@ -50,7 +50,7 @@ METAFILE="$OUTDIR/ais_${TS}.meta"
   echo "serial=${SERIAL:-<first-device>}"
   echo "lna_gain=$LNA_GAIN"
   echo "vga_gain=$VGA_GAIN"
-  echo "amp=$AMP"
+  echo "preamp=$PREAMP"
   echo "channels=$CHANNELS"
   echo "webport=$WEBPORT"
   echo "udpport=$UDPPORT"
@@ -132,7 +132,7 @@ IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 log "Recording NMEA -> $OUTFILE"
 log "Diagnostics    -> $LOGFILE"
 log "Live map       -> http://${IP:-<pi-ip>}:${WEBPORT}"
-log "HackRF LNA=$LNA_GAIN VGA=$VGA_GAIN AMP=$AMP  channels=$CHANNELS  Heartbeat every ${LIVENESS}s in the .log"
+log "HackRF LNA=$LNA_GAIN VGA=$VGA_GAIN PREAMP=$PREAMP  channels=$CHANNELS  Heartbeat every ${LIVENESS}s in the .log"
 log "Press Ctrl-C to stop."
 
 # HackRF device selection: by serial if given, else first device.
@@ -148,7 +148,7 @@ while [ "$_cleaned" = 0 ]; do
   AIS-catcher \
     "${DEV_ARG[@]}" \
     -c "$CHANNELS" \
-    -gf LNA "$LNA_GAIN" VGA "$VGA_GAIN" AMP "$AMP" \
+    -gf lna "$LNA_GAIN" vga "$VGA_GAIN" preamp "$PREAMP" \
     -N "$WEBPORT" \
     -u 127.0.0.1 "$UDPPORT" \
     -o 0 \
