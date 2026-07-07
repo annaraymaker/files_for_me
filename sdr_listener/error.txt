@@ -1,0 +1,28 @@
+53-dote@listener:~/ais $ dmesg | tail -25
+[  332.057125] usb 3-1.2: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[  332.057128] usb 3-1.2: Product: NESDR SMArt v5
+[  332.057133] usb 3-1.2: Manufacturer: Nooelec
+[  332.057137] usb 3-1.2: SerialNumber: 88873440
+[  340.668804] usb 3-1.2: USB disconnect, device number 45
+[  340.892158] usb 3-1.2: new high-speed USB device number 46 using xhci-hcd
+[  341.017320] usb 3-1.2: New USB device found, idVendor=0bda, idProduct=2838, bcdDevice= 1.00
+[  341.017328] usb 3-1.2: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[  341.017335] usb 3-1.2: Product: NESDR SMArt v5
+[  341.017339] usb 3-1.2: Manufacturer: Nooelec
+[  341.017343] usb 3-1.2: SerialNumber: 88873440
+[  351.420972] usb 3-1.2: USB disconnect, device number 46
+[  351.676446] usb 3-1.2: new high-speed USB device number 47 using xhci-hcd
+[  351.801614] usb 3-1.2: New USB device found, idVendor=0bda, idProduct=2838, bcdDevice= 1.00
+[  351.801624] usb 3-1.2: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[  351.801628] usb 3-1.2: Product: NESDR SMArt v5
+[  351.801634] usb 3-1.2: Manufacturer: Nooelec
+[  351.801638] usb 3-1.2: SerialNumber: 88873440
+[  361.149588] usb 3-1.2: USB disconnect, device number 47
+[  361.372704] usb 3-1.2: new high-speed USB device number 48 using xhci-hcd
+[  361.497853] usb 3-1.2: New USB device found, idVendor=0bda, idProduct=2838, bcdDevice= 1.00
+[  361.497862] usb 3-1.2: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[  361.497869] usb 3-1.2: Product: NESDR SMArt v5
+[  361.497873] usb 3-1.2: Manufacturer: Nooelec
+[  361.497877] usb 3-1.2: SerialNumber: 88873440
+g53-dote@listener:~/ais $ 
+
