@@ -1,42 +1,40 @@
-venv) g53-dote@attacker:~/Documents $ python3 rf_session.py --gps-port /dev/ttyUSB0 --gps-baud 4800 --victim-mmsi 677777777 --lat 42.35 --lon -70.90 --gap 15 --phase2 --phase2-gap 30 --repeat 3
-Type EXACTLY 'cage is sealed' to run the session: cage is sealed
-Exception in thread Thread-1:
-GPS feeding victim @ 42.35,-70.9 on /dev/ttyUSB0
-settling 30.0s so the transponder gets a fix...
-Traceback (most recent call last):
-  File "/home/g53-dote/Documents/venv/lib/python3.13/site-packages/serial/serialposix.py", line 322, in open
-    self.fd = os.open(self.portstr, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-              ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-FileNotFoundError: [Errno 2] No such file or directory: '/dev/ttyUSB0'
+3-dote@attacker:~/Documents/ais-simulator-master $ python3 -u ais-simulator.py --channel B -l 10
+gr-osmosdr 0.2.0.0 (0.2.0) gnuradio 3.10.12.0
+built-in sink types: uhd hackrf bladerf soapy redpitaya freesrp xtrx file 
+[INFO] [UHD] linux; GNU C++ version 14.2.0; Boost_108300; UHD_4.8.0.0+ds1-2
+ALSA lib control.c:1575:(snd_ctl_open_noupdate) Invalid CTL pulse
 
-During handling of the above exception, another exception occurred:
+RtApiAlsa::probeDeviceInfo: snd_pcm_open (playback) error for device (default), Unknown error 524.
 
-Traceback (most recent call last):
-  File "/usr/lib/python3.13/threading.py", line 1043, in _bootstrap_inner
-    self.run()
-    ~~~~~~~~^^
-  File "/home/g53-dote/Documents/rf_session.py", line 74, in run
-    self.ser = serial.Serial(self.port, self.baud, timeout=1)
-               ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/g53-dote/Documents/venv/lib/python3.13/site-packages/serial/serialutil.py", line 244, in __init__
-    self.open()
-    ~~~~~~~~~^^
-  File "/home/g53-dote/Documents/venv/lib/python3.13/site-packages/serial/serialposix.py", line 325, in open
-    raise SerialException(msg.errno, "could not open port {}: {}".format(self._port, msg))
-serial.serialutil.SerialException: [Errno 2] could not open port /dev/ttyUSB0: [Errno 2] No such file or directory: '/dev/ttyUSB0'
-connecting to ws://127.0.0.1:52002/ws
-phase 1: 21 attacks, 15.0s apart, repeat 3x
+ALSA lib pcm_asym.c:105:(_snd_pcm_asym_open) capture slave is not defined
 
-[P1:1/21] ghost_ship @ 14:50:54
-      -> ghost near victim
-      -> ghost near victim
-      -> ghost near victim
-[P1:2/21] impossible_jump @ 14:51:12
-      -> jump A at victim
-      -> jump B far
-      -> jump A at victim
-      -> jump B far
-      -> jump A at victim
-      -> jump B far
+RtApiAlsa::probeDeviceInfo: snd_pcm_open (capture) error for device (default), Invalid argument.
 
+
+RtApiAlsa::probeDeviceInfo: snd_pcm_open (playback) error for device (hw:vc4hdmi0,0), Unknown error 524.
+
+
+RtApiAlsa::probeDeviceInfo: snd_pcm_open (playback) error for device (hw:vc4hdmi1,0), Unknown error 524.
+
+
+RtApiJack::probeDevices: Jack server not found or connection error!
+
+
+RtApi::getDeviceInfo: deviceId argument not found.
+
+libusb: warning [libusb_exit] device 4.1 still referenced
+libusb: warning [libusb_exit] device 3.1 still referenced
+libusb: warning [libusb_exit] device 2.1 still referenced
+libusb: warning [libusb_exit] device 1.13 still referenced
+libusb: warning [libusb_exit] device 1.1 still referenced
+Using HackRF One with firmware 2018.01.1
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUbitstring_to_frame :info: Sentence changed!
+UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU^CSegmentation fault
+g53-dote@attacker:~/Documents/ais-simulator-master $ 
 
