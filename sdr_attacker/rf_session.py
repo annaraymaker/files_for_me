@@ -282,7 +282,7 @@ def main():
     ap.add_argument("--fast-speed", type=float, default=25.0,
                     help="knots to set the victim during the illegal-rate test "
                          "(>23kn requires 2s reporting; assigning slow is then illegal)")
-    ap.add_argument("--settle", type=float, default=30.0,
+    ap.add_argument("--settle", type=float, default=60.0,
                     help="seconds to feed GPS before starting attacks (let it get a fix)")
     ap.add_argument("--repeat", type=int, default=3,
                     help="send each attack's messages this many times (persistence)")
