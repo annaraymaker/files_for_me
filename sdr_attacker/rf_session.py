@@ -68,17 +68,29 @@ class GpsFeed(threading.Thread):
                                       f"{self.course:.1f}",d,'','','A'))
         vtg = pynmea2.VTG('GP','VTG',(f"{self.course:.1f}",'T','','M',
                                       f"{self.speed:.1f}",'N',f"{self.speed*1.852:.1f}",'K','A'))
-        return (gga, rmc, vtg)
+        # ZDA: dedicated UTC date/time sentence. AIS transponders use it to acquire
+        # UTC sync for TDMA timing. Without it, units may report "UTC sync invalid".
+        zda = pynmea2.ZDA('GP','ZDA',(t, now.strftime('%d'), now.strftime('%m'),
+                                      now.strftime('%Y'), '00','00'))
+        return (zda, gga, rmc, vtg)
 
     def run(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=1)
+        next_tick = time.monotonic()
         while not self._stop.is_set():
             for s in self._sentences():
                 try:
                     self.ser.write((str(s) + "\r\n").encode())
                 except Exception:
                     pass
-            time.sleep(self.rate)
+            # schedule the next batch on a precise cadence so the UTC timestamps
+            # advance in step with real elapsed time (helps the unit hold UTC sync).
+            next_tick += self.rate
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_tick = time.monotonic()  # fell behind; resync
         self.ser.close()
 
     def set_position(self, lat, lon, speed=None, course=None):
