@@ -207,7 +207,15 @@ def encode_type22(src_mmsi, channel_a=2087, channel_b=2088, tx_rx=0, power=0,
                  dest1=None, dest2=None):
     """Type 22: channel management (force channel/power change -> channel-mgmt tests).
     Broadcast (regional) by default; set addressed=1 with dest1/dest2 to target a unit.
-    168 bits."""
+    168 bits.
+
+    NOTE (bug fix): the addressed flag lives at bit 139 in BOTH forms. The geographic
+    (broadcast) form fills bits 69-138 with the NE/SW bounding box (18+17+18+17=70).
+    The addressed form fills the SAME 70-bit region with dest1(30)+spare(5)+dest2(30)+
+    spare(5). The previous version packed the two MMSIs back-to-back (60 bits) with no
+    interleaving spares, which pushed the addressed flag to bit 129; a conforming
+    decoder then read addressed=0 and treated the command as a broadcast regional
+    message (dest1=None). Verified against pyais in __main__."""
     b = ""
     b += _bits(22, 6)
     b += _bits(0, 2)
@@ -216,20 +224,24 @@ def encode_type22(src_mmsi, channel_a=2087, channel_b=2088, tx_rx=0, power=0,
     b += _bits(channel_a, 12)       # channel A number
     b += _bits(channel_b, 12)       # channel B number
     b += _bits(tx_rx, 4)            # tx/rx mode
-    b += _bits(power, 1)            # power (0=high,1=low)
+    b += _bits(power, 1)            # power (0=high,1=low)   -> now at bit 69
     if addressed and dest1 is not None:
-        # addressed form: two destination MMSIs in place of the geo box
-        b += _bits(dest1, 30)
-        b += _bits(dest2 if dest2 else 0, 30)
+        # addressed form: dest1(30) + spare(5) + dest2(30) + spare(5) = 70 bits
+        b += _bits(dest1, 30)                     # bits 69-98  : destination MMSI 1
+        b += _bits(0, 5)                          # bits 99-103 : spare
+        b += _bits(dest2 if dest2 else 0, 30)     # bits 104-133: destination MMSI 2
+        b += _bits(0, 5)                          # bits 134-138: spare
     else:
-        b += _bits(ne_lon, 18)      # NE corner lon (1/10 min)
-        b += _bits(ne_lat, 17)      # NE corner lat
-        b += _bits(sw_lon, 18)      # SW corner lon
-        b += _bits(sw_lat, 17)      # SW corner lat
-    b += _bits(addressed, 1)        # addressed flag
-    b += _bits(0, 1)                # bw indicator
-    b += _bits(0, 3)                # transitional zone
+        b += _bits(ne_lon, 18)      # bits 69-86  : NE corner lon (1/10 min)
+        b += _bits(ne_lat, 17)      # bits 87-103 : NE corner lat
+        b += _bits(sw_lon, 18)      # bits 104-121: SW corner lon
+        b += _bits(sw_lat, 17)      # bits 122-138: SW corner lat
+    b += _bits(addressed, 1)        # bit 139: addressed flag (both forms land here)
+    b += _bits(0, 1)                # bit 140: Band A in use
+    b += _bits(0, 1)                # bit 141: Band B in use
+    b += _bits(0, 3)                # bits 142-144: zone size
     b = (b + "0" * 168)[:168]
+    assert len(b) == 168, f"Type 22 must be 168 bits, got {len(b)}"
     return b
 
 
@@ -430,3 +442,33 @@ if __name__ == "__main__":
         iq = encode_to_iq(bits, sr)
         print(f"  sample_rate {sr}: {len(iq)} IQ samples "
               f"({len(iq)/sr*1000:.1f} ms burst incl pad)")
+
+    # optional: verify the (fixed) addressed Type 22 decodes correctly via pyais.
+    # This guards the addressed-flag position regression. Skipped if pyais absent.
+    try:
+        from pyais import decode
+
+        def _wrap(bstr):
+            payload = ""
+            padded = bstr + "0" * ((6 - len(bstr) % 6) % 6)
+            for i in range(0, len(padded), 6):
+                v = int(padded[i:i+6], 2)
+                payload += chr(v + 48 if v < 40 else v + 56)
+            fill = (6 - len(bstr) % 6) % 6
+            body = f"AIVDM,1,1,,A,{payload},{fill}"
+            cs = 0
+            for c in body:
+                cs ^= ord(c)
+            return f"!{body}*{cs:02X}"
+
+        t22 = encode_type22(3669999, channel_a=2088, channel_b=2087,
+                            addressed=1, dest1=677777777)
+        d = decode(_wrap(t22)).asdict()
+        ok = (d.get("msg_type") == 22 and d.get("addressed") in (True, 1)
+              and d.get("dest1") == 677777777)
+        print(f"  Type 22 addressed round-trip: "
+              f"{'OK' if ok else 'FAIL'} (addressed={d.get('addressed')}, "
+              f"dest1={d.get('dest1')})")
+        assert ok, "addressed Type 22 did not round-trip; check bit layout"
+    except ImportError:
+        print("  (pyais not installed; skipping Type 22 round-trip check)")

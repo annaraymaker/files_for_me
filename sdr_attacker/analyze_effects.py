@@ -48,9 +48,118 @@ def load_nmea(path, want_channel=False):
         try: d=decode(raw).asdict()
         except: continue
         ch = raw.split(',')[4] if len(raw.split(','))>4 else ''
+        # Normalize the AIVDM channel field: decoders emit either A/B or 1/2 for the two
+        # AIS channels. Without this, a decoder that reports 1/2 yields zero A and zero B,
+        # silently disabling all CHANNEL-SHIFT / M22-retune detection.
+        ch = {'1':'A','2':'B'}.get(ch, ch)
         out.append(dict(ep=ep, mmsi=d.get('mmsi'), type=d.get('msg_type'),
-                        own=raw.startswith('!AIVDO'), channel=ch))
+                        own=raw.startswith('!AIVDO'), channel=ch,
+                        lat=d.get('lat'), lon=d.get('lon')))
     return out
+
+def _peak_shift(src, ref, max_skew=20.0, bin_w=0.5):
+    """Estimate the time shift between two event streams that record the SAME events on
+    different clocks. src/ref are lists of (time, identity). We only pair events sharing
+    an identity, collect all (src_time - ref_time) deltas within +/-max_skew, and take the
+    peak of their histogram (true matches pile up at the real offset+lag; accidental pairs
+    smear out). Robust to unknown offset and to dropped frames on either side.
+
+    Returns (shift, n_matched, p10, p90) where shift = median delta at the peak and
+    p10/p90 bound its spread (the jitter), or None if too few matches."""
+    import bisect, statistics
+    from collections import Counter, defaultdict
+    ref_by = defaultdict(list)
+    for t, i in ref:
+        ref_by[i].append(t)
+    for i in ref_by:
+        ref_by[i].sort()
+    deltas = []
+    for t, i in src:
+        rs = ref_by.get(i)
+        if not rs:
+            continue
+        lo = bisect.bisect_left(rs, t - max_skew)
+        hi = bisect.bisect_right(rs, t + max_skew)
+        for r in rs[lo:hi]:
+            deltas.append(t - r)
+    if len(deltas) < 3:
+        return None
+    center = Counter(round(d / bin_w) for d in deltas).most_common(1)[0][0] * bin_w
+    near = sorted(d for d in deltas if abs(d - center) <= 1.5 * bin_w)
+    if len(near) < 3:
+        return None
+    p10 = near[int(0.10 * (len(near) - 1))]
+    p90 = near[int(0.90 * (len(near) - 1))]
+    return statistics.median(near), len(near), p10, p90
+
+
+def calibrate_clocks(manifest, vhf, serial, DY, warn_thresh=2.0):
+    """Measure the residual clock offsets between the three capture hosts from events they
+    share, so alignment does not depend on NTP quality:
+
+      attacker<->listener : each injected message is logged in the manifest (attacker clock,
+                            'sent' events, tagged with src_mmsi+mtype) AND heard on VHF
+                            (listener clock). Matching them gives shift_inject.
+      transponder<->listener: each of DY's own transmissions appears on serial (transponder
+                            clock, AIVDO) AND on VHF (listener clock, AIVDM mmsi==DY).
+                            Matching them gives shift_serial -- which also IS the serial
+                            presentation-lag distribution when the hosts are clock-synced.
+
+    Returns (shift_inject, shift_serial) in seconds (either may be None if uncalibratable).
+    The caller normalizes everything into the listener frame: manifest t += shift_inject,
+    serial ep -= shift_serial, VHF left as the reference."""
+    # attacker <-> listener, matched by (source MMSI, message type)
+    sent = [(m['t'], (m.get('src_mmsi'), m.get('mtype')))
+            for m in manifest
+            if m.get('event') == 'sent' and m.get('t') and m.get('src_mmsi') is not None]
+    vhf_inj = [(m['ep'], (m['mmsi'], m['type']))
+               for m in vhf if not m['own'] and m['mmsi'] is not None and m['mmsi'] != DY]
+    r_inj = _peak_shift(vhf_inj, sent)          # median(vhf - sent)
+    # transponder <-> listener, DY's own transmissions
+    ser_own = [(m['ep'], 'DY') for m in serial if m['own'] and m['mmsi'] == DY]
+    vhf_own = [(m['ep'], 'DY') for m in vhf if m['mmsi'] == DY]
+    r_ser = _peak_shift(ser_own, vhf_own)       # median(serial - vhf)
+
+    print("CLOCK CALIBRATION (from shared events; listener VHF is the reference frame):")
+    if r_inj:
+        s, n, lo, hi = r_inj
+        print(f"  attacker<->listener : {s:+.3f}s  (n={n} injected msgs matched, "
+              f"jitter p10..p90 {lo:+.3f}..{hi:+.3f}s)")
+        if abs(s) > warn_thresh:
+            print(f"    !! offset > {warn_thresh}s -- hosts are poorly synced. Alignment "
+                  f"corrects it, but run chrony on the LAN to shrink boundary risk.")
+        shift_inject = s
+    else:
+        print("  attacker<->listener : uncalibratable (no matched injections on VHF); "
+              "assuming 0. Check the listener heard the injected channel.")
+        shift_inject = None
+    if r_ser:
+        s, n, lo, hi = r_ser
+        print(f"  transponder<->listener: {s:+.3f}s (n={n} own-tx matched)")
+        print(f"    serial presentation lag ~ median {s:+.3f}s, jitter p10..p90 "
+              f"{lo:+.3f}..{hi:+.3f}s (report this in measurement-validity)")
+        if abs(s) > warn_thresh:
+            print(f"    !! offset > {warn_thresh}s -- large serial/host skew; see chrony note.")
+        shift_serial = s
+    else:
+        print("  transponder<->listener: uncalibratable (no DY own-tx matched on VHF); "
+              "assuming 0. Expected if VHF frame loss was total during the run.")
+        shift_serial = None
+    print("-" * 118)
+    return shift_inject, shift_serial
+
+
+def pick_dy(serial):
+    """Identify the device-under-test MMSI as the most frequent own-transmission (AIVDO)
+    sender on the serial capture. Fail loudly if the serial capture has no own-tx, rather
+    than crashing on an empty Counter."""
+    own=[m['mmsi'] for m in serial if m['own'] and m['mmsi'] is not None]
+    if not own:
+        print("ERROR: no own-transmissions (!AIVDO) with an MMSI found in the serial "
+              "capture; cannot identify the device under test. Check that the serial "
+              "recorder captured the transponder's own output and that lines are "
+              "'<iso-ts>\\t<sentence>'."); sys.exit(1)
+    return Counter(own).most_common(1)[0][0]
 
 def main():
     if len(sys.argv)<4:
@@ -59,7 +168,17 @@ def main():
     vhf=load_nmea(sys.argv[2])
     serial=load_nmea(sys.argv[3])
 
-    DY=Counter(m['mmsi'] for m in serial if m['own']).most_common(1)[0][0]
+    DY=pick_dy(serial)
+
+    # --- self-calibrate the three host clocks from shared events, then normalize every
+    # stream into the listener (VHF) frame so window attribution does not depend on NTP.
+    shift_inject, shift_serial = calibrate_clocks(manifest, vhf, serial, DY)
+    if shift_inject:
+        for m in manifest:
+            if m.get('t') is not None: m['t'] += shift_inject   # attacker -> listener frame
+    if shift_serial:
+        for m in serial:
+            m['ep'] -= shift_serial                              # transponder -> listener frame
 
     # attack windows from manifest
     begins=[(m['t'],m['name']) for m in manifest if m.get('event')=='attack_begin' and m.get('t')]
@@ -78,10 +197,13 @@ def main():
         return sorted([m for m in serial if t0<=m['ep']<=t1 and m['own']], key=lambda m:m['ep'])
     def dy_tx_vhf(t0,t1):
         return [m for m in vhf if t0<=m['ep']<=t1 and m['mmsi']==DY]
-    # collect baseline from 'recover'/quiet windows
+    # collect baseline from quiet windows: phase-2/3 'recover' windows AND the injection-
+    # free 'baseline_settle' window rf_session opens during the pre-attack settle. The
+    # latter means a phase-1-only run still has a baseline (previously it did not).
+    def is_baseline(name): return ('recover' in name) or ('baseline' in name)
     base_channels=Counter(); base_intervals=[]; base_rate_samples=[]
     for name,t0,t1 in windows:
-        if 'recover' in name:
+        if is_baseline(name):
             tx=dy_tx_serial(t0,t1)                      # rate from serial (reliable)
             base_rate_samples.append(len(tx)/(t1-t0) if t1>t0 else 0)
             for a,b in zip(tx, tx[1:]):
@@ -96,7 +218,7 @@ def main():
 
     print(f"Transponder MMSI: {DY}")
     if base_rate:
-        print(f"BASELINE (recover windows, serial rate + VHF channel): tx-rate={base_rate:.2f}/s; "
+        print(f"BASELINE (recover+settle windows, serial rate + VHF channel): tx-rate={base_rate:.2f}/s; "
               f"median inter-tx={base_interval:.1f}s; VHF channel frac A={base_bal:.2f}")
     else:
         print("baseline: insufficient")
@@ -122,7 +244,7 @@ def main():
         if rep3>0: effects.append(f"REPLIED({rep3})")
         if ack7>0: effects.append(f"ACKED({ack7})")
         # SILENCE/RATE from serial (reliable): flag only if the unit's actual tx-rate moved
-        if base_rate and rate < 0.6*base_rate and 'recover' not in name:
+        if base_rate and rate < 0.6*base_rate and not is_baseline(name):
             effects.append(f"TX-DROP({rate:.2f} vs base {base_rate:.2f})")
         if base_interval and med_iv and abs(med_iv-base_interval)/base_interval>0.4:
             effects.append(f"RATE-CHANGE({med_iv:.1f}s vs {base_interval:.1f}s)")
@@ -142,8 +264,79 @@ def main():
     print("  RATE-CHANGE=DY's inter-tx interval shifted (possible M16 rate change).")
     print("  Note: power-mode changes are NOT reliably detectable from this capture.")
 
+    # if the session included the own-MMSI echo test, report whether RF traffic leaked
+    # into the own-ship channel
+    analyze_own_mmsi_echo(manifest, vhf, serial, DY)
+
     # if the session included phase-3 source-authority cells, print the 2xN table
     analyze_phase3(manifest, vhf, serial, DY)
+
+
+def _pos_dist_deg(a_lat, a_lon, b_lat, b_lon):
+    """Rough great-circle-ish distance in degrees (flat-earth, fine for a coarse 'is this
+    the real position or the spoofed one' test)."""
+    import math
+    dlat = a_lat - b_lat
+    dlon = (a_lon - b_lon) * math.cos(math.radians((a_lat + b_lat) / 2.0))
+    return math.hypot(dlat, dlon)
+
+
+def analyze_own_mmsi_echo(manifest, vhf, serial, DY, far_deg=0.05):
+    """Did transmitting a frame with the victim's OWN MMSI (at a distinct position) leak
+    into the own-ship channel?
+
+    DY continuously reports its real (fed) position as AIVDO. The injected frame carries
+    DY's MMSI but a position ~30 km away, so any DY-MMSI sentence on serial whose position
+    is FAR from DY's own baseline position must have come from the injected RF frame, not
+    from the unit's sensor bus. We classify by the serial tag:
+      AIVDO far-position -> CONTAMINATION: unit filed received own-MMSI RF as its OWN data
+      AIVDM far-position -> unit labeled it 'other' but a duplicate-MMSI target is now in
+                            the picture (milder, still notable)
+      none far           -> not echoed to serial (rejected / absorbed / conflict-alarmed)"""
+    begins=[(m['t'],m['name']) for m in manifest
+            if m.get('event')=='attack_begin' and m.get('t') and m['name']=='own_mmsi_echo']
+    if not begins:
+        return
+    t0=begins[0][0]
+    all_beg=sorted([m['t'] for m in manifest if m.get('event')=='attack_begin' and m.get('t')])
+    later=[t for t in all_beg if t>t0]
+    t1=min(later) if later else t0+30
+
+    # DY's own baseline position: median of its AIVDO positions across the whole capture
+    dy_pos=[(m['lat'],m['lon']) for m in serial
+            if m['own'] and m['mmsi']==DY and m['lat'] is not None and m['lon'] is not None]
+    print("\n"+"="*100)
+    print("OWN-MMSI ECHO -- does received own-MMSI RF traffic leak into the own-ship channel?")
+    print("="*100)
+    if not dy_pos:
+        print("  no positioned AIVDO from DY -> cannot establish the unit's own position; "
+              "inconclusive."); return
+    base_lat=statistics.median([p[0] for p in dy_pos])
+    base_lon=statistics.median([p[1] for p in dy_pos])
+    print(f"  DY own (baseline) position ~ {base_lat:.4f},{base_lon:.4f}; "
+          f"flagging DY-MMSI serial sentences > {far_deg} deg away as injected.")
+
+    contam=[]; other=[]
+    for m in serial:
+        if not (t0<=m['ep']<=t1): continue
+        if m['mmsi']!=DY or m['lat'] is None or m['lon'] is None: continue
+        if _pos_dist_deg(m['lat'],m['lon'],base_lat,base_lon) > far_deg:
+            (contam if m['own'] else other).append(m)
+    if contam:
+        ex=contam[0]
+        print(f"  ** CONTAMINATION: {len(contam)} AIVDO (own-tagged) sentence(s) at the "
+              f"INJECTED position (e.g. {ex['lat']:.4f},{ex['lon']:.4f}). The unit filed "
+              f"received own-MMSI RF traffic as its OWN data. This is a real finding.")
+    elif other:
+        ex=other[0]
+        print(f"  DUPLICATE-MMSI: {len(other)} AIVDM (other-tagged) sentence(s) at the "
+              f"injected position ({ex['lat']:.4f},{ex['lon']:.4f}). Correctly classified "
+              f"as 'other', but a target sharing DY's MMSI is now in the picture.")
+    else:
+        print("  no DY-MMSI sentence at the injected position appeared on serial during the "
+              "window -> the frame was rejected/absorbed (or a conflict alarm was raised, "
+              "which this NMEA capture cannot see). Check the unit's alarm log to confirm.")
+
 
 def analyze_phase3(manifest, vhf, serial, DY):
     """Build the base-vs-regular source-authority table from phase-3 cells.
@@ -170,10 +363,10 @@ def analyze_phase3(manifest, vhf, serial, DY):
         later=[t for t in all_beg if t>t0]
         return min(later) if later else t0+90
 
-    # baseline tx interval from recover windows (serial)
+    # baseline tx interval from quiet windows (recover cells + the settle baseline), serial
     rec_iv=[]
     rb=[(m['t'],m['name']) for m in manifest if m.get('event')=='attack_begin'
-        and m.get('t') and 'recover' in m['name']]
+        and m.get('t') and ('recover' in m['name'] or 'baseline' in m['name'])]
     for t0,_ in rb:
         t1=wend(t0)
         tx=sorted([m['ep'] for m in serial if t0<=m['ep']<=t1 and m['own']])

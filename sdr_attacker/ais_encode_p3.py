@@ -92,14 +92,22 @@ if __name__ == '__main__':
             cs ^= ord(c)
         return f"!{body}*{cs:02X}"
 
+    # Assertions include the numeric payload fields (not just type/src/dest) so a silent
+    # mis-encode of the reporting rate (M16) or the slot reservation (M20) -- the actual
+    # quantities the experiment manipulates -- fails the self-test loudly. pyais decodes
+    # these under the keys offset1/increment1 (M16) and offset1/number1/timeout1 (M20).
     tests = [
-        ("M15", m15_interrogation(BASE, V), {'msg_type': 15, 'mmsi': BASE, 'mmsi1': V}),
-        ("M16", m16_assignment(BASE, V, increment=1000), {'msg_type': 16, 'mmsi': BASE, 'mmsi1': V}),
-        ("M20", m20_datalink(BASE), {'msg_type': 20, 'mmsi': BASE}),
+        ("M15", m15_interrogation(BASE, V, req_type=5),
+         {'msg_type': 15, 'mmsi': BASE, 'mmsi1': V, 'type1_1': 5}),
+        ("M16", m16_assignment(BASE, V, offset=0, increment=1000),
+         {'msg_type': 16, 'mmsi': BASE, 'mmsi1': V, 'offset1': 0, 'increment1': 1000}),
+        ("M20", m20_datalink(BASE, offset=100, number=10, timeout=7),
+         {'msg_type': 20, 'mmsi': BASE, 'offset1': 100, 'number1': 10, 'timeout1': 7}),
         ("M22ch", m22_channel(BASE, V, channel_a=2088, channel_b=2087),
-         {'msg_type': 22, 'mmsi': BASE, 'addressed': True, 'dest1': V}),
+         {'msg_type': 22, 'mmsi': BASE, 'addressed': True, 'dest1': V,
+          'channel_a': 2088, 'channel_b': 2087}),
         ("M22pw", m22_channel(BASE, V, power=1),
-         {'msg_type': 22, 'mmsi': BASE, 'power': True, 'addressed': True}),
+         {'msg_type': 22, 'mmsi': BASE, 'power': True, 'addressed': True, 'dest1': V}),
         ("M6", m6_addressed(BASE, V), {'msg_type': 6, 'mmsi': BASE, 'dest_mmsi': V}),
     ]
     all_ok = True
