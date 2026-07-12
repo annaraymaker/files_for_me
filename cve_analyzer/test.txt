@@ -1,1 +1,15 @@
-test
+# transponder Pi — capture the unit's AIS OUTPUT port
+python3 record_serial.py --port /dev/ttyAIS --baud 38400        # -> ais_serial_*.nmea
+
+# same transponder Pi — feed the malformed sentences to the unit's GPS INPUT port
+python3 serial_cve_suite.py --gps-port /dev/ttyUSB0 --gps-baud 4800 \
+  --lat 42.35 --lon -70.90 --i-confirm-cage-sealed
+
+
+(Also start the VHF listener and record that)
+
+
+python3 analyze_serial_cve.py \
+  ~/ais_tx/serialcve_<timestamp>.jsonl \
+  ais_serial_<timestamp>.nmea \
+  ais_<timestamp>.nmea
