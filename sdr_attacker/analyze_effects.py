@@ -339,17 +339,17 @@ def analyze_own_mmsi_echo(manifest, vhf, serial, DY, far_deg=0.05):
 
 
 def analyze_phase3(manifest, vhf, serial, DY):
-    """Build the base-vs-regular source-authority table from phase-3 cells.
+    """Build the phase-3 tables. Two categories, printed separately:
 
-    Each phase-3 test cell is tagged in the manifest with command= and source=. For each
-    command we compare what the transponder did when the command came from a base station
-    versus a regular ship, using the per-command observable:
-      M15  -> Type-3 replies (does it answer the interrogation)
-      M6   -> Type-7 acks    (does it acknowledge the addressed message)
-      M16  -> tx inter-interval change over the dwell (does it change reporting rate)
-      M22  -> channel shift / serial-continues-but-VHF-vanishes (does it retune)
-    Well-observed: M15, M6, M16, M22 channel. Poorly observed (reported but flagged):
-    M20 slot reservation, M22 power.
+    3A SOURCE AUTHORITY (M16/M20/M22): a base station is announced (Message 4) throughout,
+       then the command is issued once from the BASE and once from a REGULAR ship. Acting
+       from the regular ship = no source-authority check (the worse finding). Observables:
+         M16 -> tx interval gets SHORTER (we force the MAX rate; a Class A can only be sped up)
+         M22 channel -> serial continues but VHF vanishes / channel balance flips (retune)
+         M20 slot, M22 power -> weakly observable, reported but flagged.
+    3B MANDATORY RESPONSE (M15/M6): the spec REQUIRES a unit to answer interrogation and to
+       acknowledge addressed binary from ANY source, so a response is compliant -- reported
+       as forced-response / amplification, not as a source-authority failure.
     """
     import statistics
     begins=[(m['t'],m['name'],m.get('command'),m.get('source'))
@@ -389,59 +389,91 @@ def analyze_phase3(manifest, vhf, serial, DY):
         results[(cmd,src)]=dict(rep3=rep3, ack7=ack7, rcvd=rcvd, med_iv=med_iv,
                                 serial_tx=serial_tx, vhf_tx=vhf_tx, va=va, vb=vb)
 
-    # print the 2xN table
-    print("\n" + "="*100)
-    print("PHASE 3 -- SOURCE AUTHORITY: does the unit act on the command from BASE vs REGULAR?")
-    print("="*100)
-    print(f"baseline tx interval (recover windows): "
-          f"{base_iv:.2f}s" if base_iv else "baseline interval: n/a")
     cmds=[]
     for (cmd,src) in results:
         if cmd not in cmds: cmds.append(cmd)
-    print(f"\n{'command':22} {'source':8} {'observable -> verdict'}")
-    print("-"*100)
-    for cmd in cmds:
+    # Two categories: management commands (M16/M20/M22) are the real source-authority test;
+    # M15/M6 responses are spec-MANDATORY from any source, so they are reported separately as
+    # forced-response/amplification, NOT as an authority failure.
+    authority=[c for c in cmds if c.startswith(('M16','M20','M22'))]
+    mandatory=[c for c in cmds if c.startswith(('M15','M6'))]
+
+    def verdict(cmd, r):
+        if cmd.startswith('M15'):
+            return f"Type3 replies={r['rep3']:>3} -> {'RESPONDED' if r['rep3']>0 else 'no reply'}"
+        if cmd.startswith('M6'):
+            return f"Type7 acks={r['ack7']:>3}    -> {'ACKED' if r['ack7']>0 else 'no ack'}"
+        if cmd.startswith('M16'):
+            # we now force the MAX rate; success = the unit's interval gets SHORTER (faster)
+            if base_iv and r['med_iv']:
+                faster = r['med_iv'] < 0.7*base_iv
+                return (f"tx-interval={r['med_iv']:.2f}s(base {base_iv:.2f}) -> "
+                        f"{'FASTER: rate forced up (ACTED)' if faster else 'no change'}")
+            return "tx-interval=n/a -> inconclusive"
+        if cmd.startswith('M22_channel'):
+            div = r['serial_tx']>0 and r['vhf_tx']==0
+            return (f"serial_tx={r['serial_tx']} vhf_tx={r['vhf_tx']} A/B={r['va']}/{r['vb']} -> "
+                    f"{'RETUNED (serial cont, VHF gone)' if div else 'still on AIS channels'}")
+        if cmd.startswith('M22_power'):
+            return f"(power not reliably observable) serial_tx={r['serial_tx']}"
+        if cmd.startswith('M20'):
+            return f"(slot effect weakly observable) serial_tx={r['serial_tx']} rcvd={r['rcvd']}"
+        return f"rcvd={r['rcvd']}"
+
+    print("\n" + "="*100)
+    print("PHASE 3A -- SOURCE AUTHORITY: with a base station announced (M4), does the unit act on")
+    print("           a management command from the BASE vs from a REGULAR ship?")
+    print("="*100)
+    print(f"baseline tx interval: {base_iv:.2f}s" if base_iv else "baseline interval: n/a")
+    print(f"\n{'command':22} {'source':8} observable -> verdict"); print("-"*100)
+    for cmd in authority:
         for src in ('base','regular'):
             r=results.get((cmd,src))
-            if not r: continue
-            # pick the observable + verdict per command family
-            if cmd.startswith('M15'):
-                v=f"Type3 replies={r['rep3']:>3}  -> {'ACTED' if r['rep3']>0 else 'no reply'}"
-            elif cmd.startswith('M6'):
-                v=f"Type7 acks={r['ack7']:>3}     -> {'ACTED' if r['ack7']>0 else 'no ack'}"
-            elif cmd.startswith('M16'):
-                if base_iv and r['med_iv']:
-                    changed=abs(r['med_iv']-base_iv)/base_iv>0.4
-                    v=f"tx-interval={r['med_iv']:.2f}s(base {base_iv:.2f}) -> {'RATE CHANGED' if changed else 'no change'}"
-                else:
-                    v=f"tx-interval=n/a -> inconclusive"
-            elif cmd.startswith('M22_channel'):
-                # retune signature: serial continues but VHF vanishes, OR channel balance flips
-                div = r['serial_tx']>0 and r['vhf_tx']==0
-                v=(f"serial_tx={r['serial_tx']} vhf_tx={r['vhf_tx']} A/B={r['va']}/{r['vb']} -> "
-                   f"{'RETUNED (serial cont, VHF gone)' if div else 'still on AIS channels'}")
-            elif cmd.startswith('M22_power'):
-                v=f"(power not reliably observable) serial_tx={r['serial_tx']}"
-            elif cmd.startswith('M20'):
-                v=f"(slot effect weakly observable) serial_tx={r['serial_tx']} rcvd={r['rcvd']}"
-            else:
-                v=f"rcvd={r['rcvd']}"
-            print(f"{cmd:22} {src:8} {v}")
-        # per-command base-vs-regular contrast note
+            if r: print(f"{cmd:22} {src:8} {verdict(cmd,r)}")
         rb_=results.get((cmd,'base')); rr_=results.get((cmd,'regular'))
         if rb_ and rr_:
-            if cmd.startswith('M15'):
-                note=_contrast("interrogation reply", rb_['rep3'], rr_['rep3'])
-            elif cmd.startswith('M6'):
-                note=_contrast("acknowledgement", rb_['ack7'], rr_['ack7'])
-            else:
-                note=""
+            note=_authority_contrast(cmd, rb_, rr_, base_iv)
             if note: print(f"{'':22} {'':8} => {note}")
         print()
-    print("KEY QUESTION answered per command: if the REGULAR-source row shows the unit ACTED,")
-    print("the unit does NOT enforce base-station authority for that command (the worse finding).")
-    print("If only the BASE row acts, the unit is spec-compliant but the command is still abusable")
-    print("by anyone able to forge a base-station MMSI (which is unauthenticated).")
+    print("KEY: a REGULAR-source row that ACTED => the unit does NOT enforce base authority")
+    print("     (worst case). BASE-only => spec-compliant, but still abusable: the base MMSI and")
+    print("     the Message 4 that establishes it are both unauthenticated and forgeable.")
+
+    if mandatory:
+        print("\n" + "="*100)
+        print("PHASE 3B -- MANDATORY RESPONSE (NOT source authority): the spec REQUIRES a unit to")
+        print("           answer M15 and acknowledge M6 from ANY station. A response is COMPLIANT;")
+        print("           the finding is forced-response / amplification, not a missing check.")
+        print("="*100)
+        print(f"\n{'command':22} {'source':8} observable -> (response is spec-mandatory)")
+        print("-"*100)
+        for cmd in mandatory:
+            for src in ('base','regular'):
+                r=results.get((cmd,src))
+                if r: print(f"{cmd:22} {src:8} {verdict(cmd,r)}")
+            print()
+        print("Responding to strangers here is REQUIRED behavior -> report as amplification /")
+        print("forced-response (an attacker can elicit replies at will), not as a source-auth gap.")
+
+
+def _authority_contrast(cmd, rb_, rr_, base_iv):
+    """Did the unit ACT for base vs regular, for a management command? Returns the verdict
+    line, or an inconclusive note when the effect isn't reliably observable (M20/M22-power)."""
+    def acted(r):
+        if cmd.startswith('M16'):
+            return (base_iv is not None and r['med_iv'] is not None
+                    and r['med_iv'] < 0.7*base_iv)
+        if cmd.startswith('M22_channel'):
+            return r['serial_tx']>0 and r['vhf_tx']==0
+        return None   # M20 slot / M22 power: not reliably observable here
+    ab, ar = acted(rb_), acted(rr_)
+    if ab is None or ar is None:
+        return "effect not reliably observable -> inconclusive for source authority"
+    if ar:
+        return "ACTS on a REGULAR ship's command -> NO source-authority check (worst case)"
+    if ab:
+        return "acts only from the base -> enforces source authority (base still forgeable)"
+    return "no observable action from either source -> ignored / not observable"
 
 
 def _contrast(label, base_n, reg_n):
