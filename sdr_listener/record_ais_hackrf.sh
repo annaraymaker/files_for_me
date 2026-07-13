@@ -65,6 +65,12 @@ read -r -d '' LOGGER <<'PY' || true
 import socket, sys, datetime, threading
 outpath, port, liveness = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 out = open(outpath, "a", buffering=1)
+# live echo goes straight to the controlling terminal, not inherited stdout (a backgrounded
+# process's stdout does not reliably reach the screen). Falls back to stdout if no tty.
+try:
+    screen = open("/dev/tty", "w")
+except Exception:
+    screen = sys.stdout
 count = {"n": 0}
 lock = threading.Lock()
 
@@ -96,7 +102,10 @@ try:
             line = line.strip()
             if line:
                 out.write(f"{ts}\t{line}\n")
-                sys.stdout.write(f"{ts}\t{line}\n")   # echo NMEA to screen (live debug)
+                try:
+                    screen.write(f"{ts}\t{line}\n"); screen.flush()   # live echo to terminal
+                except Exception:
+                    pass
                 with lock:
                     count["n"] += 1
 except KeyboardInterrupt:
