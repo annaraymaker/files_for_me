@@ -42,6 +42,10 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTFILE="$OUTDIR/ais_${TS}.nmea"
 LOGFILE="$OUTDIR/ais_${TS}.log"
 METAFILE="$OUTDIR/ais_${TS}.meta"
+# JSON-Full side channel (AIS-catcher -o 5 with -M D) carries per-message signal power +
+# ppm -- the observable we need to tell whether the victim obeyed an M22 power-low command.
+# This is separate from the NMEA UDP path, which all the other tooling still consumes.
+LEVELFILE="$OUTDIR/ais_${TS}_level.json"
 
 # ---- record the active config so runs are comparable later ----
 {
@@ -100,6 +104,12 @@ try:
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for line in data.decode("ascii", "replace").splitlines():
             line = line.strip()
+            # -M D/T can prepend an NMEA tag block ("\...\!AIVDM,..."); strip it so the .nmea
+            # stays plain AIVDM/AIVDO for the existing decoders (signal power lives in the JSON).
+            if line.startswith("\\"):
+                j = line.find("\\", 1)
+                if j != -1:
+                    line = line[j+1:].strip()
             if line:
                 out.write(f"{ts}\t{line}\n")
                 try:
@@ -133,13 +143,20 @@ cleanup() {
   kill "$LOGGER_PID" 2>/dev/null || true
   wait "$LOGGER_PID" 2>/dev/null || true
   lines="$(wc -l < "$OUTFILE" 2>/dev/null || echo 0)"
+  jlines="$(wc -l < "$LEVELFILE" 2>/dev/null || echo 0)"
   log "Stopped. Recorded ${lines} NMEA lines to ${OUTFILE}"
+  log "Signal-power JSON: ${jlines} lines -> ${LEVELFILE}"
+  if [ "$jlines" -eq 0 ]; then
+    log "WARNING: level JSON is empty -- your AIS-catcher may not emit 'level' with -M D/-o 5;"
+    log "         check '$LEVELFILE' and 'AIS-catcher -h' (the field is 'level'/'signalpower')."
+  fi
   log "Diagnostics: ${LOGFILE}   Config: ${METAFILE}"
 }
 trap cleanup EXIT
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 log "Recording NMEA -> $OUTFILE"
+log "Signal power    -> $LEVELFILE (JSON, per-message level/ppm)"
 log "Diagnostics    -> $LOGFILE"
 log "Live map       -> http://${IP:-<pi-ip>}:${WEBPORT}"
 log "HackRF LNA=$LNA_GAIN VGA=$VGA_GAIN PREAMP=$PREAMP  channels=$CHANNELS  Heartbeat every ${LIVENESS}s in the .log"
@@ -155,15 +172,20 @@ RUN=1
 while [ "$_cleaned" = 0 ]; do
   log "starting AIS-catcher (attempt $RUN)" | tee -a "$LOGFILE"
   set +e
+  # -M D T : generate decoder metadata (signal power, ppm) + NMEA timestamp.
+  # -o 5   : JSON Full on stdout -> LEVELFILE (one JSON object per message, incl. "level"/
+  #          "signalpower" and "ppm"). The NMEA UDP path to the logger is unchanged.
   AIS-catcher \
     "${DEV_ARG[@]}" \
     -c "$CHANNELS" \
     -gf lna "$LNA_GAIN" vga "$VGA_GAIN" preamp "$PREAMP" \
     -N "$WEBPORT" \
     -u 127.0.0.1 "$UDPPORT" \
-    -o 0 \
+    -M D T \
+    -o 5 \
     -X off \
     -v "$STATS" \
+    1>>"$LEVELFILE" \
     2>>"$LOGFILE"
   rc=$?
   set -e
