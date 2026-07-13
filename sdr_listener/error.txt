@@ -1,94 +1,12 @@
-g53-dote@listener:~/ais $ AIS-catcher -d:0 -gr TUNER 40.2 RTLAGC off -p 0 -o 0 -u 127.0.0.1 10110 -N 8100 -v 5
-AIS-catcher (build Jun 27 2026) v0.70-3417-g48289445
-(C) Copyright 2021-2026 jvde-github and other contributors
-This is free software; see the source for copying conditions. There is NO
-warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-Hint: Use '-X on' to share with aiscatcher.org community (enables community overlay) or '-X off' to disable. Currently ON by default.
-rtlsdr_write_reg failed with -1
-Resetting device...
-rtlsdr_write_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_read_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_read_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_read_reg failed with -4
-rtlsdr_write_reg failed with -4
-rtlsdr_read_reg failed with -4
-rtlsdr_write_reg failed with -4
-No supported tuner found
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-Enabled direct sampling mode, input 1
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-UDP: open socket for host: 127.0.0.1, port: 10110, msgformat: NMEA, sources: ALL
-TCP feed: open socket for host: 185.77.96.227, port: 4242, persist: ON, keep_alive: ON, reset: 180, msgformat: COMMUNITY_HUB, gps OFF, own_interval 10, sources: 1, status: connected
+g53-dote@emtrak:~/Documents $ AIS-catcher -h 2>&1 | grep -iE 'json|level|ppm|meta| -M|-u |-o'
+	[-E [config file] [bind address:port] - managed mode: engine run from config file with control server, must be only option (defaults: config.json, control port 8118, viewer on control port + 1, local access without password; use 0.0.0.0:port for LAN access with password)]
+	[-G [LEVEL level] [SYSTEM on] - control logging (levels: DEBUG, INFO, WARNING, ERROR, CRITICAL) or enable system logging]
+	[-M xxx - set additional meta data to generate: T = NMEA timestamp, D = decoder related (signal power, ppm) (default: none)]
+	[-n show NMEA messages on screen without detail (-o 1)]
+	[-o set output mode (0 = quiet, 1 = NMEA only, 2 = NMEA+, 3 = NMEA+ in JSON, 4 JSON Sparse, 5 JSON Full (default: 2)]
+	[-O MMSI - sets the own mmsi of the receiver]
+	[-p xxx - set frequency correction for device in PPM (default: zero)]
+	[-q suppress NMEA messages to screen (-o 0)]
+	[-u xxx.xx.xx.xx yyy - UDP destination address and port (default: off)]
+g53-dote@emtrak:~/Documents $ 
 
-HTML Server running at port 8100
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-rtlsdr_demod_write_reg failed with -4
-rtlsdr_demod_read_reg failed with -4
-RTLSDR: cannot set frequency.
-rtlsdr_write_reg failed with -4
-g53-dote@listener:~/ais $ 
