@@ -54,8 +54,53 @@ def load_nmea(path, want_channel=False):
         ch = {'1':'A','2':'B'}.get(ch, ch)
         out.append(dict(ep=ep, mmsi=d.get('mmsi'), type=d.get('msg_type'),
                         own=raw.startswith('!AIVDO'), channel=ch,
-                        lat=d.get('lat'), lon=d.get('lon')))
+                        lat=d.get('lat'), lon=d.get('lon'), radio=d.get('radio')))
     return out
+
+
+def load_alerts(path):
+    """Scan a capture for the unit's alarm/rejection sentences (emitted on the serial port):
+    $--ALR (alarm), $--ALC/$--ALF (alarm lists), $--NAK (negative acknowledgement / reject),
+    $--TXT (text). Returns list of {ep, kind, aid, text}. These carry the unit's OWN reaction
+    to injected traffic and are a strong, under-used signal (an attack that raises an alarm or
+    is NAK'd is processed, not silently ignored)."""
+    out = []
+    for l in open(path, errors='replace'):
+        if '\t' not in l:
+            continue
+        ts_s, raw = l.split('\t', 1); raw = raw.strip()
+        if not (raw.startswith('$') and len(raw) > 6):
+            continue
+        kind = raw[3:6]
+        if kind not in ('ALR', 'ALC', 'ALF', 'NAK', 'TXT'):
+            continue
+        ep = parse_ts(ts_s)
+        if ep is None:
+            continue
+        f = raw.split('*')[0].split(',')
+        aid = f[2] if kind == 'ALR' and len(f) > 2 else (f[1] if len(f) > 1 else '')
+        text = next((x for x in reversed(f) if any(c.isalpha() for c in x) and ':' in x or 'AIS' in x), '')
+        out.append(dict(ep=ep, kind=kind, aid=aid, text=text))
+    return out
+
+
+def parse_commstate(radio, mtype):
+    """Decode the 19-bit SOTDMA (Msg 1) radio/communication-state field into the unit's own
+    slot allocation. Msg 3 (ITDMA) has a different layout; we return its slot increment.
+    Returns (kind, key, value) where key/value is the slot the unit currently occupies."""
+    if radio is None:
+        return None
+    sync = (radio >> 17) & 0x3
+    if mtype == 3:                                   # ITDMA: slot increment + number
+        return ("ITDMA", "slot_increment", (radio >> 13) & 0x1FFF)
+    to = (radio >> 14) & 0x7                          # SOTDMA slot timeout
+    sub = radio & 0x3FFF
+    if to == 0:               key = "slot_offset"
+    elif to in (2, 4, 6):     key = "slot_number"
+    elif to in (3, 5, 7):     key = "received_stations"
+    elif to == 1:             key = "utc"
+    else:                     key = "sub"
+    return ("SOTDMA", key, sub)
 
 def _peak_shift(src, ref, max_skew=20.0, bin_w=0.5):
     """Estimate the time shift between two event streams that record the SAME events on
@@ -149,6 +194,84 @@ def calibrate_clocks(manifest, vhf, serial, DY, warn_thresh=2.0):
     return shift_inject, shift_serial
 
 
+def parse_rxtime(v):
+    """AIS-catcher JSON timestamp -> epoch. Accepts unix seconds, 'YYYYMMDDHHMMSS', or ISO."""
+    from datetime import datetime, timezone
+    if v is None: return None
+    try:
+        f = float(v)
+        # a unix time is ~1.7e9 (10 digits); a 'YYYYMMDDHHMMSS' packs to ~2e13 (14 digits),
+        # so only treat 10-11 digit values as unix and let the packed form fall to strptime.
+        if 1e8 < f < 1e11: return f
+    except (TypeError, ValueError):
+        pass
+    s = str(v)
+    for fmt in ("%Y%m%d%H%M%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try: return datetime.strptime(s[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError: continue
+    return None
+
+
+def load_levels(path):
+    """AIS-catcher -o 5 (JSON Full) with -M D: one JSON object per received message carrying
+    the signal 'level' (dB) and 'ppm'. We keep {ep, mmsi, level, ppm} for the power analysis."""
+    out = []
+    for l in open(path, errors='replace'):
+        l = l.strip()
+        if not l or l[0] != '{': continue
+        try: d = json.loads(l)
+        except Exception: continue
+        lvl = d.get('level', d.get('signalpower'))
+        if lvl is None: continue
+        ep = None
+        for k in ('rxuxtime', 'rxtime', 'timestamp', 'time'):
+            if k in d:
+                ep = parse_rxtime(d[k])
+                if ep is not None: break
+        if ep is None: continue
+        try: lvl = float(lvl)
+        except (TypeError, ValueError): continue
+        out.append(dict(ep=ep, mmsi=d.get('mmsi'), level=lvl, ppm=d.get('ppm')))
+    return out
+
+
+def analyze_power(windows, is_baseline, DY, levels):
+    """M22 power-low observable: the victim's own transmissions' RECEIVED level at our listener.
+    In a fixed cage the geometry is constant, so a real drop to low power (12.5W -> 1W is ~11 dB)
+    shows up as a clear fall in the victim's received level during a power-low window."""
+    print("=" * 118)
+    print("SIGNAL POWER (M22 power-low) -- median received level of the VICTIM's own tx per window")
+    if not levels:
+        print("  no level JSON supplied (pass ais_*_level.json as arg 4) -- power stays unobservable")
+        return
+    dyl = [x for x in levels if x['mmsi'] == DY]
+    if not dyl:
+        print(f"  level JSON has no readings for the victim MMSI {DY} (was it heard? check gain)")
+        return
+    base = [x['level'] for name, t0, t1 in windows if is_baseline(name)
+            for x in dyl if t0 <= x['ep'] <= t1]
+    base_med = statistics.median(base) if base else None
+    print(f"  baseline own-tx level (recover+settle): "
+          f"{f'{base_med:.1f} dB (n={len(base)})' if base_med is not None else 'insufficient'}")
+    pw = [(n, t0, t1) for n, t0, t1 in windows if 'power' in n.lower()]
+    if not pw:
+        print("  (no power-low windows in this session)"); return
+    print(f"  {'window':32}{'n':>4}{'median dB':>11}{'vs base':>9}   verdict")
+    for name, t0, t1 in pw:
+        vals = [x['level'] for x in dyl if t0 <= x['ep'] <= t1]
+        if not vals:
+            print(f"  {name[:31]:32}{0:>4}{'-':>11}{'-':>9}   silent/not heard (could be power-off)")
+            continue
+        med = statistics.median(vals)
+        delta = (med - base_med) if base_med is not None else None
+        verdict = ("POWER DROP -> likely OBEYED" if (delta is not None and delta <= -3)
+                   else "no clear drop" if delta is not None else "no baseline")
+        ds = f"{delta:+.1f}" if delta is not None else "-"
+        print(f"  {name[:31]:32}{len(vals):>4}{med:>11.1f}{ds:>9}   {verdict}")
+    print("  >=3 dB fall in the victim's received level during a power-low command = it cut tx")
+    print("  power (obeyed). A full 12.5W->1W switch is ~11 dB. Geometry is fixed in the cage.")
+
+
 def pick_dy(serial):
     """Identify the device-under-test MMSI as the most frequent own-transmission (AIVDO)
     sender on the serial capture. Fail loudly if the serial capture has no own-tx, rather
@@ -163,10 +286,11 @@ def pick_dy(serial):
 
 def main():
     if len(sys.argv)<4:
-        print("usage: analyze_effects.py <manifest.jsonl> <vhf.nmea> <serial.nmea>"); sys.exit(1)
+        print("usage: analyze_effects.py <manifest.jsonl> <vhf.nmea> <serial.nmea> [level.json]"); sys.exit(1)
     manifest=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
     vhf=load_nmea(sys.argv[2])
     serial=load_nmea(sys.argv[3])
+    levels=load_levels(sys.argv[4]) if len(sys.argv)>4 else []
 
     DY=pick_dy(serial)
 
@@ -262,14 +386,93 @@ def main():
     print("  DY's tx channel balance moved from baseline (possible M22 retune). TX-DROP=DY's")
     print("  transmit rate fell below 60% of baseline (possible quiet/retune-to-unhearable).")
     print("  RATE-CHANGE=DY's inter-tx interval shifted (possible M16 rate change).")
-    print("  Note: power-mode changes are NOT reliably detectable from this capture.")
+    print("  Note: M22 power-low is judged separately in the SIGNAL POWER section (needs level.json).")
 
     # if the session included the own-MMSI echo test, report whether RF traffic leaked
     # into the own-ship channel
     analyze_own_mmsi_echo(manifest, vhf, serial, DY)
 
+    # the unit's own alarms / NAKs / slot behavior on the serial port (its reaction to attacks)
+    analyze_alerts_slots(manifest, serial, DY, sys.argv[3], shift_serial or 0)
+
+    # M22 power-low: victim's own-tx received level per window (needs the AIS-catcher level JSON)
+    analyze_power(windows, is_baseline, DY, levels)
+
     # if the session included phase-3 source-authority cells, print the 2xN table
     analyze_phase3(manifest, vhf, serial, DY)
+
+
+def analyze_alerts_slots(manifest, serial, DY, serial_path, shift_serial=0):
+    """Per-attack: the unit's OWN reaction on its serial port -- alarms ($--ALR, with text),
+    negative acknowledgements ($--NAK), and its SOTDMA slot behaviour. Counts are reported as
+    EXCESS over the unit's baseline chatter (em-trak emits thousands of NAKs even when idle, so
+    a raw count is meaningless). An attack that raises a specific alarm or is NAK'd is PROCESSED,
+    which distinguishes 'silently ignored' from 'rejected with a signal' -- exactly what we need
+    to explain a command like M22 channel management that produced no positional effect."""
+    alerts = load_alerts(serial_path)
+    for a in alerts:                                 # bring alert timestamps into the listener frame
+        a['ep'] -= shift_serial
+    begins = [(m['t'], m['name']) for m in manifest if m.get('event') == 'attack_begin' and m.get('t')]
+    if not begins:
+        return
+    windows = [(n, t, (begins[i + 1][0] if i + 1 < len(begins) else t + 30))
+               for i, (t, n) in enumerate(begins)]
+    def is_base(n): return 'recover' in n or 'baseline' in n
+
+    base_dur = sum(t1 - t0 for n, t0, t1 in windows if is_base(n)) or 1e-9
+    def base_rate(kind):
+        c = 0
+        for a in alerts:
+            if a['kind'] != kind: continue
+            for (n, t0, t1) in windows:
+                if is_base(n) and t0 <= a['ep'] <= t1:
+                    c += 1; break
+        return c / base_dur
+    alr_rate, nak_rate = base_rate('ALR'), base_rate('NAK')
+
+    def slot_set(t0, t1):
+        s = set()
+        for m in serial:
+            if m['own'] and m['mmsi'] == DY and m['type'] in (1, 3) and t0 <= m['ep'] <= t1:
+                cs = parse_commstate(m.get('radio'), m['type'])
+                if cs and cs[1] in ('slot_offset', 'slot_number', 'slot_increment'):
+                    s.add((cs[1], cs[2]))
+        return s
+    base_slots = set()
+    for n, t0, t1 in windows:
+        if is_base(n): base_slots |= slot_set(t0, t1)
+
+    print("\n" + "=" * 110)
+    print("UNIT REACTION per attack -- alarms / NAKs / slot behaviour (from the serial port)")
+    print("=" * 110)
+    print(f"baseline chatter: {alr_rate*60:.1f} ALR/min, {nak_rate*60:.0f} NAK/min "
+          f"(counts below are EXCESS over that)")
+    print(f"{'attack':26}{'ALR+':>5}{'NAK+':>6}  {'slotshift':>9}  alarm text raised")
+    print("-" * 110)
+    from collections import Counter
+    any_row = False
+    for n, t0, t1 in windows:
+        if is_base(n):
+            continue
+        dur = max(t1 - t0, 1e-6)
+        alr = [a for a in alerts if a['kind'] == 'ALR' and t0 <= a['ep'] <= t1]
+        nak = sum(1 for a in alerts if a['kind'] == 'NAK' and t0 <= a['ep'] <= t1)
+        alr_ex = len(alr) - alr_rate * dur
+        nak_ex = nak - nak_rate * dur
+        sv = slot_set(t0, t1)
+        new_slots = [x for x in sv if x not in base_slots]
+        shift = "yes" if (base_slots and len(new_slots) >= 2) else ""
+        if alr_ex >= 3 or nak_ex >= 5 or (shift and n.startswith(('p2_slot', 'p2_tdma', 'p3_M20'))):
+            any_row = True
+            texts = "; ".join(t for t, _ in Counter(a['text'] for a in alr if a['text']).most_common(2))
+            print(f"{n[:25]:26}{max(0, round(alr_ex)):>5}{max(0, round(nak_ex)):>6}  {shift:>9}  {texts[:44]}")
+    if not any_row:
+        print("  (no attack raised alarms/NAKs or shifted slots above baseline)")
+    print("-" * 110)
+    print("ALR+ = alarms raised above baseline (text shows which). NAK+ = extra rejections. An")
+    print("attack with ALR+/NAK+ is PROCESSED, not silently ignored (e.g. a channel command that")
+    print("shows no retune but a NAK/alarm means the unit parsed and REJECTED it). slotshift is a")
+    print("WEAK indicator (SOTDMA reselects slots normally); only trust it for M20/flood windows.")
 
 
 def _pos_dist_deg(a_lat, a_lon, b_lat, b_lon):
@@ -304,7 +507,8 @@ def analyze_own_mmsi_echo(manifest, vhf, serial, DY, far_deg=0.05):
 
     # DY's own baseline position: median of its AIVDO positions across the whole capture
     dy_pos=[(m['lat'],m['lon']) for m in serial
-            if m['own'] and m['mmsi']==DY and m['lat'] is not None and m['lon'] is not None]
+            if m['own'] and m['mmsi']==DY and m['lat'] is not None and m['lon'] is not None
+            and abs(m['lat'])<=90]   # exclude the 91/181 not-available sentinel
     print("\n"+"="*100)
     print("OWN-MMSI ECHO -- does received own-MMSI RF traffic leak into the own-ship channel?")
     print("="*100)
