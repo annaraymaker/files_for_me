@@ -96,6 +96,7 @@ try:
             line = line.strip()
             if line:
                 out.write(f"{ts}\t{line}\n")
+                sys.stdout.write(f"{ts}\t{line}\n")   # echo NMEA to screen (live debug)
                 with lock:
                     count["n"] += 1
 except KeyboardInterrupt:
