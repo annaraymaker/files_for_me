@@ -167,30 +167,59 @@ if [ -n "$SERIAL" ]; then DEV_ARG=(-d "$SERIAL"); else DEV_ARG=(-d:0); fi
 
 # ---- restart loop: a USB hiccup or transient receiver error should NOT silently
 # end the capture. Each (re)start is timestamped in the .log so a crash is a
-# visible event, not a dead run. Ctrl-C breaks the loop via the trap. ----
-RUN=1
-while [ "$_cleaned" = 0 ]; do
-  log "starting AIS-catcher (attempt $RUN)" | tee -a "$LOGFILE"
+# visible event, not a dead run. Ctrl-C breaks the loop via the trap.
+#
+# The signal-power capture (-M D for level/ppm, -o 5 JSON Full -> LEVELFILE) is an ADD-ON:
+# the primary NMEA capture must never be held hostage to it. If AIS-catcher exits almost
+# immediately WITH those flags (e.g. an older build rejects them), we auto-disable the power
+# capture and keep recording plain NMEA, rather than spinning forever. If it also fast-exits
+# WITHOUT them, that's a real receiver problem and we abort with the log tail. ----
+#
+# -M D : generate decoder metadata (signal power, ppm). Single token -- some builds reject
+#        "-M D T"; the JSON's own rxtime is enough, so we don't ask for the NMEA timestamp.
+# -o 5 : JSON Full on stdout -> LEVELFILE. The NMEA UDP path to the logger is unchanged.
+run_catcher() {  # $1 = "level" to enable the power add-on, else plain
+  local extra=()
+  if [ "$1" = "level" ]; then extra=(-M D -o 5); else extra=(-o 0); fi
   set +e
-  # -M D T : generate decoder metadata (signal power, ppm) + NMEA timestamp.
-  # -o 5   : JSON Full on stdout -> LEVELFILE (one JSON object per message, incl. "level"/
-  #          "signalpower" and "ppm"). The NMEA UDP path to the logger is unchanged.
-  AIS-catcher \
-    "${DEV_ARG[@]}" \
-    -c "$CHANNELS" \
-    -gf lna "$LNA_GAIN" vga "$VGA_GAIN" preamp "$PREAMP" \
-    -N "$WEBPORT" \
-    -u 127.0.0.1 "$UDPPORT" \
-    -M D T \
-    -o 5 \
-    -X off \
-    -v "$STATS" \
-    1>>"$LEVELFILE" \
-    2>>"$LOGFILE"
-  rc=$?
-  set -e
+  if [ "$1" = "level" ]; then
+    AIS-catcher "${DEV_ARG[@]}" -c "$CHANNELS" \
+      -gf lna "$LNA_GAIN" vga "$VGA_GAIN" preamp "$PREAMP" \
+      -N "$WEBPORT" -u 127.0.0.1 "$UDPPORT" "${extra[@]}" -X off -v "$STATS" \
+      1>>"$LEVELFILE" 2>>"$LOGFILE"
+  else
+    AIS-catcher "${DEV_ARG[@]}" -c "$CHANNELS" \
+      -gf lna "$LNA_GAIN" vga "$VGA_GAIN" preamp "$PREAMP" \
+      -N "$WEBPORT" -u 127.0.0.1 "$UDPPORT" "${extra[@]}" -X off -v "$STATS" \
+      2>>"$LOGFILE"
+  fi
+  local rc=$?; set -e; return $rc
+}
+
+RUN=1; MODE="level"; FASTFAILS=0
+while [ "$_cleaned" = 0 ]; do
+  log "starting AIS-catcher (attempt $RUN, mode=$MODE)" | tee -a "$LOGFILE"
+  start=$(date +%s)
+  rc=0; run_catcher "$MODE" || rc=$?     # '|| rc=$?' so a non-zero exit does NOT trip set -e
+  ran=$(( $(date +%s) - start ))
   [ "$_cleaned" = 1 ] && break
-  log "AIS-catcher exited (rc=$rc); restarting in ${RESTART_WAIT}s" | tee -a "$LOGFILE"
+  if [ "$ran" -lt 8 ]; then
+    FASTFAILS=$((FASTFAILS+1))
+    if [ "$MODE" = "level" ] && [ "$FASTFAILS" -ge 2 ]; then
+      log "AIS-catcher keeps exiting fast WITH the power flags (-M D -o 5); DISABLING the" | tee -a "$LOGFILE"
+      log "signal-power capture and continuing with plain NMEA. Real error is in $LOGFILE:" | tee -a "$LOGFILE"
+      tail -n 8 "$LOGFILE" | sed 's/^/    /'
+      MODE="plain"; FASTFAILS=0; continue
+    fi
+    if [ "$MODE" = "plain" ] && [ "$FASTFAILS" -ge 3 ]; then
+      log "FATAL: AIS-catcher exits immediately even without the power flags -- receiver problem:"
+      tail -n 15 "$LOGFILE" | sed 's/^/    /'
+      exit 1
+    fi
+  else
+    FASTFAILS=0
+  fi
+  log "AIS-catcher exited (rc=$rc, ran ${ran}s); restarting in ${RESTART_WAIT}s" | tee -a "$LOGFILE"
   RUN=$((RUN+1))
   sleep "$RESTART_WAIT"
 done
