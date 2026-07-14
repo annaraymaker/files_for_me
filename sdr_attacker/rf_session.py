@@ -426,6 +426,38 @@ def build_phase3(ctx):
     return cells
 
 
+# ---- M20 slot-reservation suite (focused, re-runnable without the full session) ----------
+# The single 10-slot reservation in phase 3 is too small to force a visible squeeze, so its
+# effect can't be separated from ordinary SOTDMA slot churn. This suite sweeps the RESERVATION
+# DENSITY: the M20 "number of slots" field is only ~4 bits (<=15), so a large fraction of the
+# frame is reserved by REPEATING the block via the `increment` field (reserve `number` slots
+# every `increment` slots). A unit that honors M20 must vacate an increasing share of the frame,
+# which shows up as rising slot reselection / spread; one that ignores it stays flat as density
+# climbs. Each reservation cell is followed by a clean control cell (base announced, no
+# reservation) so the analyzer has a traffic-matched baseline right beside each test.
+def build_m20_suite(ctx):
+    V = ctx.victim_mmsi
+    blat, blon = ctx.victim_lat, ctx.victim_lon
+    m4 = (p3enc.m4_base_report(BASE_MMSI, blat, blon), "M4: announce base station")
+    clean = (p3enc.m4_base_report(BASE_MMSI, blat, blon), "clean control: base announced, no reservation")
+    # (source, label, kwargs, human) -- density sweep from base, plus one dense from a regular ship
+    plan = [
+        ("base",    "small",     dict(offset=100, number=10, timeout=7, increment=0),  "10 slots, single block (~0.4% of frame)"),
+        ("base",    "half",      dict(offset=0,   number=10, timeout=7, increment=20), "10 of every 20 slots (~50% of frame)"),
+        ("base",    "dense",     dict(offset=0,   number=10, timeout=7, increment=15), "10 of every 15 slots (~67% of frame)"),
+        ("base",    "verydense", dict(offset=0,   number=15, timeout=7, increment=20), "15 of every 20 slots (~75% of frame)"),
+        ("regular", "dense",     dict(offset=0,   number=10, timeout=7, increment=15), "10 of every 15 slots (~67% of frame)"),
+    ]
+    src_mmsi = {"base": BASE_MMSI, "regular": REGULAR_MMSI}
+    cells = []
+    for src, label, kw, human in plan:
+        cells.append((f"m20_{src}_{label}",
+                      [m4, m4, (p3enc.m20_datalink(src_mmsi[src], **kw),
+                                f"[SRC={src.upper()}] M20 reserve {human}")]))
+        cells.append((f"m20_recover_after_{src}_{label}", [m4, clean]))
+    return cells
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run a full GPS+attack session (synced).")
     ap.add_argument("--gps-port", required=True, help="serial port feeding the victim GPS")
@@ -450,6 +482,14 @@ def main():
                          "MMSI and a regular ship MMSI, to test whether the unit checks source")
     ap.add_argument("--phase3-only", action="store_true",
                     help="skip phases 1 and 2 and run ONLY the source-authority matrix")
+    ap.add_argument("--m20", action="store_true",
+                    help="also run the focused M20 slot-reservation density suite")
+    ap.add_argument("--m20-only", action="store_true",
+                    help="run ONLY the M20 slot-reservation suite (skip phases 1-3) so it can be "
+                         "re-run on its own without repeating the whole session")
+    ap.add_argument("--m20-gap", type=float, default=35.0,
+                    help="dwell after each M20 cell (>= a few victim report cycles so the slot "
+                         "map re-settles and the reaction is visible)")
     ap.add_argument("--phase3-gap", type=float, default=90.0,
                     help="seconds of dwell after each phase-3 command (kept long so slow "
                          "effects like rate changes or retunes have time to appear)")
@@ -547,10 +587,43 @@ def main():
         rec(event="attack_end", name=name)
 
     try:
-        for i, (name, payloads) in enumerate(timeline):
-            fire(name, payloads, i, len(timeline), tag="P1:")
-            if i < len(timeline) - 1:
-                time.sleep(args.gap)
+        if not (args.m20_only or args.phase2_only or args.phase3_only):
+            for i, (name, payloads) in enumerate(timeline):
+                fire(name, payloads, i, len(timeline), tag="P1:")
+                if i < len(timeline) - 1:
+                    time.sleep(args.gap)
+
+        # ---- M20 slot-reservation density suite (focused; --m20 or --m20-only) ----
+        if args.m20 or args.m20_only:
+            m20 = build_m20_suite(ctx)
+            # constant fast speed for the whole suite -> dense, uniform slot sampling; a fixed
+            # speed keeps the reporting rate the same in control and test windows (no confound).
+            gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=args.fast_speed, course=90.0)
+            rec(event="victim_speed_set", speed=args.fast_speed, note="constant speed for M20 slot sampling")
+            print(f"\n=== M20 SUITE: {len(m20)} cells, {args.m20_gap}s dwell each "
+                  f"(victim SOG={args.fast_speed}kn for dense sampling) ===")
+            time.sleep(8)
+            # clean baseline-control window (no injection at all) for the traffic-matched reference
+            rec(event="attack_begin", name="m20_baseline_control", index=-1, phase="M20:",
+                victim_lat=ctx.victim_lat, victim_lon=ctx.victim_lon, victim_speed=gps.speed)
+            print(f"    baseline control (no reservation), {args.m20_gap:.0f}s ...")
+            time.sleep(args.m20_gap)
+            rec(event="attack_end", name="m20_baseline_control")
+            rec(event="m20_start", n=len(m20), gap=args.m20_gap,
+                base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI)
+            for i, (name, payloads) in enumerate(m20):
+                extra = None
+                if name.startswith("m20_recover_"):
+                    extra = {"command": "M20", "source": "recovery"}
+                else:
+                    parts = name[len("m20_"):].split("_", 1)   # m20_<src>_<label>
+                    extra = {"command": "M20", "source": parts[0], "density": parts[1] if len(parts) > 1 else ""}
+                fire(name, payloads, i, len(m20), tag="M20:", extra=extra)
+                if i < len(m20) - 1:
+                    print(f"    ...{args.m20_gap:.0f}s dwell (watch slot behaviour)...")
+                    time.sleep(args.m20_gap)
+            gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
+            rec(event="victim_speed_set", speed=0.0, note="restored after M20 suite")
 
         # ---- phase 2: aggressive tests, larger gaps, severity-ordered ----
         if args.phase2 or args.phase2_only:
