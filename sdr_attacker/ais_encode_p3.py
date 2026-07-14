@@ -79,6 +79,15 @@ def m16_rate_assignment(src_mmsi, dest_mmsi, reports_per_10min):
                     'offset1': r, 'increment1': 0})
 
 
+def m16_rate_raw(src_mmsi, dest_mmsi, reports_per_10min):
+    """M16 rate assignment with NO range validation, to probe OUT-OF-SPEC values: 0 (would be
+    "0 reports" -> silence?), or > 600 (past the maximum). A conformant unit clamps these
+    (0 -> next multiple of 20 = 20; >600 -> 600); a unit that obeys the raw value is a finding.
+    offset1 is a 12-bit field (0..4095)."""
+    return _encode({'msg_type': 16, 'mmsi': src_mmsi, 'mmsi1': dest_mmsi,
+                    'offset1': int(reports_per_10min) & 0xFFF, 'increment1': 0})
+
+
 def m16_slot_assignment(src_mmsi, dest_mmsi, increment_code, offset=0):
     """M16 SLOT assignment: increment is a CODE 1..6 (1=1125, 2=375, 3=225, 4=125, 5=75,
     6=45 slots between transmissions). 0 = rate mode, 7 = 'disregard', and anything else is
