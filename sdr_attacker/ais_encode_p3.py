@@ -11,6 +11,8 @@ Every message here has been verified to decode back to the intended type, source
 destination with pyais. Using a maintained, independently-validated encoder also means
 the correctness of the injected commands is not something a reviewer has to take on trust.
 """
+from datetime import datetime, timezone
+
 from pyais.encode import encode_dict
 from pyais import decode
 
@@ -47,7 +49,7 @@ def m15_interrogation(src_mmsi, dest_mmsi, req_type=5):
                     'mmsi1': dest_mmsi, 'type1_1': req_type})
 
 
-def m4_base_report(src_mmsi, lat, lon, epfd=7):
+def m4_base_report(src_mmsi, lat, lon, epfd=7, when=None):
     """M4: base station report. Announces a base station at (lat, lon), so a receiving unit
     treats src_mmsi as an established, controlling base station in its cell.
 
@@ -55,8 +57,19 @@ def m4_base_report(src_mmsi, lat, lon, epfd=7):
     Message 20 received "without a base station report (Message 4) should be ignored", and
     the assignment (M16) and channel-management (M22) functions are base-station operations.
     Without a preceding M4 a conforming unit correctly ignores those commands -- which is why
-    the earlier phase-3 run showed "no effect" for M16/M20/M22."""
-    return _encode({'msg_type': 4, 'mmsi': src_mmsi, 'lat': lat, 'lon': lon, 'epfd': epfd})
+    the earlier phase-3 run showed "no effect" for M16/M20/M22.
+
+    UTC FIX: a real base station report carries a LIVE UTC date/time stamp; that stamp is how a
+    mobile decides the base is UTC-synchronised and therefore a trustworthy timing/authority
+    source. pyais previously left these fields at their defaults, so the base announced
+    1970-01-01T00:00:00 -- an unsynchronised base, which a conservative unit may accept for a
+    low-stakes rate assignment (M16) yet refuse for the higher-stakes FATDMA reservation (M20)
+    or channel retune (M22). We now stamp the CURRENT UTC (override with `when`, a tz-aware
+    datetime) so the base looks synchronised and that confound is removed."""
+    t = when or datetime.now(timezone.utc)
+    return _encode({'msg_type': 4, 'mmsi': src_mmsi, 'lat': lat, 'lon': lon,
+                    'epfd': epfd, 'year': t.year, 'month': t.month, 'day': t.day,
+                    'hour': t.hour, 'minute': t.minute, 'second': t.second})
 
 
 # --- Message 16 assignment: two DISTINCT modes, per ITU-R M.1371-5 Table 67 footnote (1) ---
@@ -105,11 +118,44 @@ def m20_datalink(src_mmsi, offset=100, number=10, timeout=7, increment=0):
 
 
 def m22_channel(src_mmsi, dest_mmsi, channel_a=2087, channel_b=2088, power=0):
-    """M22: addressed channel management to dest_mmsi (commands a channel/power change)."""
+    """M22: ADDRESSED channel management to dest_mmsi (commands a channel/power change).
+
+    NOTE: the addressed form is the spec's OPTIONAL path ("Alternatively, this message may be
+    used ... as an addressed message"). Many Class A units deliberately refuse to auto-retune
+    from a single addressed RF M22 -- that refusal is spec-permitted, so an ignored addressed
+    M22 is NOT proof of a bug. Use m22_channel_regional() to test the primary (regional
+    broadcast) path before concluding a unit ignores channel management."""
     return _encode({'msg_type': 22, 'mmsi': src_mmsi,
                     'channel_a': channel_a, 'channel_b': channel_b,
                     'power': power, 'addressed': 1,
                     'dest1': dest_mmsi, 'dest2': 0})
+
+
+def bbox_around(lat, lon, half_deg=0.5):
+    """Return (ne_lon, ne_lat, sw_lon, sw_lat) for a square region centred on (lat, lon).
+
+    half_deg=0.5 deg is ~30 NM per side -- comfortably inside the 120 NM evaluation range and
+    large enough that rounding to the M22 corner resolution (1/10 min) still encloses the unit.
+    Corners are returned in DECIMAL DEGREES (pyais scales them to the 18/17-bit 1/10-min fields).
+    """
+    return (lon + half_deg, lat + half_deg, lon - half_deg, lat - half_deg)
+
+
+def m22_channel_regional(src_mmsi, vlat, vlon, channel_a=2087, channel_b=2088, power=0,
+                         half_deg=0.5):
+    """M22: REGIONAL (broadcast) channel management for the area around (vlat, vlon).
+
+    This is the spec's PRIMARY channel-management path (ITU-R M.1371-5, Msg 22, p.135): a base
+    station broadcasts the VHF data-link parameters "for the geographical area designated in this
+    message", accompanied by a Message 4, evaluated within 120 NM. It is addressed=0 with a NE/SW
+    bounding box that must ENCLOSE the target unit. A unit that ignores the addressed form but
+    honours this one is behaving exactly to spec -- so run BOTH and compare."""
+    ne_lon, ne_lat, sw_lon, sw_lat = bbox_around(vlat, vlon, half_deg)
+    return _encode({'msg_type': 22, 'mmsi': src_mmsi,
+                    'channel_a': channel_a, 'channel_b': channel_b,
+                    'power': power, 'addressed': 0,
+                    'ne_lon': ne_lon, 'ne_lat': ne_lat,
+                    'sw_lon': sw_lon, 'sw_lat': sw_lat})
 
 
 def m6_addressed(src_mmsi, dest_mmsi, dac=1, fid=0):
@@ -158,6 +204,11 @@ if __name__ == '__main__':
           'channel_a': 2088, 'channel_b': 2087}),
         ("M22pw", m22_channel(BASE, V, power=1),
          {'msg_type': 22, 'mmsi': BASE, 'power': True, 'addressed': True, 'dest1': V}),
+        # regional (broadcast) M22: addressed=0, and the victim (42.35,-70.90) must fall INSIDE
+        # the decoded NE/SW box -- assert enclosure, not exact corners (1/10-min rounding).
+        ("M22reg", m22_channel_regional(BASE, 42.35, -70.90, channel_a=2088, channel_b=2087),
+         {'msg_type': 22, 'mmsi': BASE, 'addressed': False,
+          'channel_a': 2088, 'channel_b': 2087}),
         ("M6", m6_addressed(BASE, V), {'msg_type': 6, 'mmsi': BASE, 'dest_mmsi': V}),
     ]
     all_ok = True
