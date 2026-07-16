@@ -475,24 +475,47 @@ def build_m20_suite(ctx):
 #      the regional one -- so testing only the addressed form cannot conclude "ignores M22".
 # M16 (max + beyond-max rate) is included as a positive control: it already works, so it confirms
 # the base is being accepted and the heartbeat is doing its job.
-def build_base_retest(ctx, half_deg=0.5):
+def build_base_retest(ctx, half_deg=0.5, offband_ch=2078):
     V = ctx.victim_mmsi
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
     m4 = (p3enc.m4_base_report(BASE_MMSI, vlat, vlon), "M4: announce base (live UTC)")
 
-    def recover():
-        return [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0),
-                 "RECOVERY addressed -> AIS channels + high power"),
+    def recover(tag=""):
+        # full restore: dual AIS channels, HIGH power, BOTH-channel Tx, rate released -- sent both
+        # addressed AND regional so recovery never depends on the unit honouring only one form.
+        return [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B,
+                                   power=0, txrx=0),
+                 f"RECOVERY{tag} addressed -> AIS A/B, high power, both-channel Tx"),
                 (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon, channel_a=AIS_CH_A,
-                                            channel_b=AIS_CH_B, power=0, half_deg=half_deg),
-                 "RECOVERY regional -> AIS channels + high power"),
+                                            channel_b=AIS_CH_B, power=0, txrx=0, half_deg=half_deg),
+                 f"RECOVERY{tag} regional -> AIS A/B, high power, both-channel Tx"),
                 (p3enc.m16_rate_assignment(BASE_MMSI, V, 20),
-                 "RECOVERY release rate (autonomous wins, self-times-out)")]
+                 f"RECOVERY{tag} release rate (autonomous wins, self-times-out)")]
 
     cells = []
-    # --- M16: positive control + beyond-spec. Fired at REST so the forced MAX rate is an
-    #     unmistakable speed-up against the unit's slow anchored baseline. M16 already works, so
-    #     this doubles as a live check that the base + M4 heartbeat are being accepted at all. ---
+
+    # ===== M20: GO HARD -- density sweep 50% -> 100% of the frame reserved ==================
+    # Runner holds the victim at a CONSTANT fast SOG across this whole block so reporting rate is
+    # matched and the ONLY variable is reservation density. Run FIRST (before M16) so no lingering
+    # rate assignment pollutes the control. Names are m20_base_p<NN> (percent) so analyze_m20.py
+    # sorts/verdicts them. A compliant unit must vacate a rising share of the frame -> rising slot
+    # reselection; a unit that ignores M20 stays flat as density climbs.
+    cells.append(("m20_base_control", [m4, m4]))                       # same-speed baseline
+    m20_plan = [
+        ("p50",  dict(offset=0, number=10, timeout=7, increment=20), "10 of every 20 (~50%)"),
+        ("p60",  dict(offset=0, number=12, timeout=7, increment=20), "12 of every 20 (~60%)"),
+        ("p67",  dict(offset=0, number=10, timeout=7, increment=15), "10 of every 15 (~67%)"),
+        ("p75",  dict(offset=0, number=15, timeout=7, increment=20), "15 of every 20 (~75%)"),
+        ("p83",  dict(offset=0, number=15, timeout=7, increment=18), "15 of every 18 (~83%)"),
+        ("p94",  dict(offset=0, number=15, timeout=7, increment=16), "15 of every 16 (~94%)"),
+        ("p100", dict(offset=0, number=15, timeout=7, increment=15), "15 of every 15 (~100%)"),
+    ]
+    for label, kw, human in m20_plan:
+        cells.append((f"m20_base_{label}",
+            [m4, m4, (p3enc.m20_datalink(BASE_MMSI, **kw), f"M20 reserve {human}")]))
+    cells.append(("m20_base_control2", [m4, m4]))                      # trailing same-speed control
+
+    # ===== M16: positive control (at REST so the forced MAX rate is an obvious speed-up) ====
     cells.append(("br_M16_ratemax",
         [m4, m4, (p3enc.m16_rate_assignment(BASE_MMSI, V, 600),
                   "M16 CONTROL force MAX rate 600/10min (known-good)")]))
@@ -500,30 +523,35 @@ def build_base_retest(ctx, half_deg=0.5):
         [m4, m4, (p3enc.m16_rate_raw(BASE_MMSI, V, 1000),
                   "M16 beyond-spec 1000/10min (past the 600 max; obeying it is a finding)")]))
     cells.append(("br_recover_M16", [m4] + recover()))
-    # --- M20 density block. The runner holds the victim at a CONSTANT fast speed across this whole
-    #     block (control + sweep) so reporting rate is matched and the ONLY variable is how much of
-    #     the frame is reserved. Cells are named m20_base_* so analyze_m20.py picks up its
-    #     density-sweep honor/ignore verdict with zero changes; m20_base_control (no reservation)
-    #     is the same-speed baseline it compares against. A compliant unit must vacate a rising
-    #     share of the frame as density climbs 50 -> 67 -> 75%. ---
-    cells.append(("m20_base_control", [m4, m4]))
-    for label, kw, human in [
-        ("half",      dict(offset=0, number=10, timeout=7, increment=20), "10 of 20 slots (~50%)"),
-        ("dense",     dict(offset=0, number=10, timeout=7, increment=15), "10 of 15 slots (~67%)"),
-        ("verydense", dict(offset=0, number=15, timeout=7, increment=20), "15 of 20 slots (~75%)"),
-    ]:
-        cells.append((f"m20_base_{label}",
-            [m4, m4, (p3enc.m20_datalink(BASE_MMSI, **kw), f"M20 reserve {human}")]))
-    # --- M22 both ways (at rest), each with its own recovery ---
-    cells.append(("br_M22_addressed",
-        [m4, m4, (p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_B, channel_b=AIS_CH_A),
-                  "M22 ADDRESSED swap channels A<->B (optional path)")]))
-    cells.append(("br_recover_M22addr", [m4] + recover()))
-    cells.append(("br_M22_regional",
-        [m4, m4, (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon,
-                  channel_a=AIS_CH_B, channel_b=AIS_CH_A, half_deg=half_deg),
-                  "M22 REGIONAL swap channels A<->B (spec-primary broadcast path, box around victim)")]))
-    cells.append(("br_recover_M22reg", [m4] + recover()))
+
+    # ===== M22: STRONG + OBVIOUS -- each variant fired BOTH addressed and regional ==========
+    # Observables chosen to be UNAMBIGUOUS on the listener; each test is followed by a full
+    # recovery so a working retune can never strand the unit off-channel:
+    #   txA_only / txB_only -> Tx/Rx mode 1/2: channel balance collapses to ~100/0 or 0/100
+    #   single_ais1         -> both channels = AIS1: all Tx on one frequency
+    #   offband             -> both channels = a NON-AIS number: DUT vanishes from the AIS pair,
+    #                          and must REAPPEAR after recovery (the clean, reversible proof)
+    #   power_low           -> power bit low: DUT's received signal level drops (~11 dB at 1W)
+    m22_variants = [
+        ("txA_only",    dict(channel_a=AIS_CH_A, channel_b=AIS_CH_B, txrx=1),
+         "Tx CHANNEL A ONLY (obey -> balance ~100/0)"),
+        ("txB_only",    dict(channel_a=AIS_CH_A, channel_b=AIS_CH_B, txrx=2),
+         "Tx CHANNEL B ONLY (obey -> balance ~0/100)"),
+        ("single_ais1", dict(channel_a=AIS_CH_A, channel_b=AIS_CH_A, txrx=0),
+         "BOTH channels = AIS1 (obey -> all Tx on one freq)"),
+        ("offband",     dict(channel_a=offband_ch, channel_b=offband_ch, txrx=0),
+         f"OFF-BAND retune to ch {offband_ch} (obey -> DUT vanishes from AIS A/B, returns on recovery)"),
+        ("power_low",   dict(channel_a=AIS_CH_A, channel_b=AIS_CH_B, txrx=0, power=1),
+         "POWER LOW (obey -> received level drops ~11 dB)"),
+    ]
+    for label, kw, human in m22_variants:
+        cells.append((f"br_M22_{label}_addressed",
+            [m4, m4, (p3enc.m22_channel(BASE_MMSI, V, **kw), f"M22 ADDRESSED {human}")]))
+        cells.append((f"br_recover_M22_{label}_addr", [m4] + recover()))
+        cells.append((f"br_M22_{label}_regional",
+            [m4, m4, (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon, half_deg=half_deg, **kw),
+                      f"M22 REGIONAL {human}")]))
+        cells.append((f"br_recover_M22_{label}_reg", [m4] + recover()))
     return cells
 
 
@@ -574,6 +602,10 @@ def main():
     ap.add_argument("--region-half-deg", type=float, default=0.5,
                     help="half-size (deg) of the regional M22 bounding box around the victim "
                          "(0.5 deg ~30NM/side, well inside the 120NM evaluation range)")
+    ap.add_argument("--offband-ch", type=int, default=2078,
+                    help="channel number for the M22 OFF-BAND retune test (default 2078, a valid "
+                         "marine channel clearly outside the AIS pair 2087/2088). Point a second "
+                         "receiver here if you want to SEE the unit reappear off-band.")
     ap.add_argument("--phase3-gap", type=float, default=90.0,
                     help="seconds of dwell after each phase-3 command (kept long so slow "
                          "effects like rate changes or retunes have time to appear)")
@@ -694,25 +726,32 @@ def main():
         # Runs ONLY the base-station management commands with a live-UTC M4 heartbeat maintained
         # through every dwell. Lets you settle M20/M22 without rerunning phases 1-3.
         if args.base_retest or args.base_retest_only:
-            br = build_base_retest(ctx, half_deg=args.region_half_deg)
+            br = build_base_retest(ctx, half_deg=args.region_half_deg,
+                                   offband_ch=args.offband_ch)
             print(f"\n=== BASE RE-TEST: {len(br)} cells, {args.base_retest_gap}s dwell each, "
                   f"M4 heartbeat every {args.m4_heartbeat}s ===")
-            print("    M16 control (+ beyond-max) | M20 dense 50/67/75% | M22 addressed + regional")
-            print("    watch serial (own reports) + VHF (witness) for rate/channel/slot change\n")
+            print("    M20 sweep 50->100%  |  M16 control (+ over-max)  |  M22 txA/txB/single/"
+                  f"offband(ch{args.offband_ch})/power, each addressed + regional")
+            print("    OBVIOUS observables: VHF channel balance (txA/txB/single), DUT vanish+return")
+            print("    (offband), received level (power-low), slot reselection (M20).")
+            print("    ** KEEP THE LISTENER + AIS-catcher RECORDING UNTIL 'done' PRINTS **\n")
             rec(event="base_retest_start", n=len(br), gap=args.base_retest_gap,
                 m4_heartbeat=args.m4_heartbeat, base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI,
-                region_half_deg=args.region_half_deg)
+                region_half_deg=args.region_half_deg, offband_ch=args.offband_ch)
 
             def _br_extra(nm):
                 low = nm.lower()
-                if "recover" in low or "control" in low:
-                    return {"command": "recovery" if "recover" in low else "M20",
-                            "source": "base", "density": nm.split("_")[-1] if "control" in low else ""}
                 if nm.startswith("m20_base_"):
                     return {"command": "M20", "source": "base", "density": nm.split("_")[-1]}
-                parts = nm[len("br_"):].split("_", 1)   # br_<command>_<variant>
-                return {"command": parts[0], "source": "base",
-                        "variant": parts[1] if len(parts) > 1 else ""}
+                if "recover" in low:
+                    return {"command": "recovery", "source": "base", "variant": low}
+                body = nm[len("br_"):]                  # e.g. M22_offband_regional / M16_ratemax
+                cmd = body.split("_", 1)[0]
+                rest = body[len(cmd) + 1:] if "_" in body else ""
+                form = ("addressed" if rest.endswith("addressed") else
+                        "regional" if rest.endswith("regional") else "")
+                variant = rest.rsplit("_", 1)[0] if form else rest
+                return {"command": cmd, "source": "base", "variant": variant, "form": form}
 
             fast_on = False
             for i, (name, payloads) in enumerate(br):
