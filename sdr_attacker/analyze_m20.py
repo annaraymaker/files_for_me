@@ -41,8 +41,17 @@ def load_commstate(path, dy):
     return out
 
 
-DENS_PCT = {"small": "~0.4%", "half": "~50%", "dense": "~67%", "verydense": "~75%"}
-DENS_ORDER = {"small": 0, "half": 1, "dense": 2, "verydense": 3}
+# legacy fixed labels (old m20 suite) plus the new percent labels p50..p100 from the base-retest.
+_LEGACY_PCT = {"small": 0.4, "half": 50, "dense": 67, "verydense": 75}
+
+def dens_pct(label):
+    """Reservation density (percent of frame) for an m20_base_<label> window, or None if the
+    label is a control/unknown. Handles legacy labels and the new p<NN> percent labels."""
+    if label in _LEGACY_PCT:
+        return _LEGACY_PCT[label]
+    if label.startswith("p") and label[1:].isdigit():
+        return float(label[1:])
+    return None
 
 
 def main():
@@ -97,9 +106,10 @@ def main():
     ctrl_hi = max(ctrl) if ctrl else None
     ctrl_med = statistics.median(ctrl) if ctrl else None
 
-    # density sweep from the base
-    sweep = sorted([(DENS_ORDER[n.split('_')[-1]], n, rows[n])
-                    for n in rows if n.startswith('m20_base_') and n.split('_')[-1] in DENS_ORDER],
+    # density sweep from the base (exclude the control windows; order by actual percent)
+    sweep = sorted([(dens_pct(n.split('_')[-1]), n, rows[n])
+                    for n in rows if n.startswith('m20_base_')
+                    and 'control' not in n and dens_pct(n.split('_')[-1]) is not None],
                    key=lambda x: x[0])
 
     print("\nVERDICT")

@@ -117,8 +117,15 @@ def m20_datalink(src_mmsi, offset=100, number=10, timeout=7, increment=0):
                     'number1': number, 'timeout1': timeout, 'increment1': increment})
 
 
-def m22_channel(src_mmsi, dest_mmsi, channel_a=2087, channel_b=2088, power=0):
-    """M22: ADDRESSED channel management to dest_mmsi (commands a channel/power change).
+def m22_channel(src_mmsi, dest_mmsi, channel_a=2087, channel_b=2088, power=0, txrx=0):
+    """M22: ADDRESSED channel management to dest_mmsi (commands a channel/power/mode change).
+
+    txrx (Tx/Rx mode, Table 75): 0 = Tx A / Tx B (both, default), 1 = Tx on channel A only,
+        2 = Tx on channel B only. Modes 1/2 are the OBVIOUS single-channel test -- a unit that
+        obeys collapses its transmit channel balance to ~100/0 (or 0/100).
+    power: 0 = high, 1 = low. A unit that obeys power=1 shows a clear drop in received level.
+    channel_a/channel_b may be set equal (force one AIS frequency) or to a NON-AIS channel
+        number (off-band retune) -- obedience then shows as the unit vanishing from the AIS pair.
 
     NOTE: the addressed form is the spec's OPTIONAL path ("Alternatively, this message may be
     used ... as an addressed message"). Many Class A units deliberately refuse to auto-retune
@@ -127,7 +134,7 @@ def m22_channel(src_mmsi, dest_mmsi, channel_a=2087, channel_b=2088, power=0):
     broadcast) path before concluding a unit ignores channel management."""
     return _encode({'msg_type': 22, 'mmsi': src_mmsi,
                     'channel_a': channel_a, 'channel_b': channel_b,
-                    'power': power, 'addressed': 1,
+                    'power': power, 'txrx': txrx, 'addressed': 1,
                     'dest1': dest_mmsi, 'dest2': 0})
 
 
@@ -142,18 +149,21 @@ def bbox_around(lat, lon, half_deg=0.5):
 
 
 def m22_channel_regional(src_mmsi, vlat, vlon, channel_a=2087, channel_b=2088, power=0,
-                         half_deg=0.5):
+                         txrx=0, half_deg=0.5):
     """M22: REGIONAL (broadcast) channel management for the area around (vlat, vlon).
 
     This is the spec's PRIMARY channel-management path (ITU-R M.1371-5, Msg 22, p.135): a base
     station broadcasts the VHF data-link parameters "for the geographical area designated in this
     message", accompanied by a Message 4, evaluated within 120 NM. It is addressed=0 with a NE/SW
     bounding box that must ENCLOSE the target unit. A unit that ignores the addressed form but
-    honours this one is behaving exactly to spec -- so run BOTH and compare."""
+    honours this one is behaving exactly to spec -- so run BOTH and compare.
+
+    txrx / power / channel semantics are identical to m22_channel() above (single-channel via
+    txrx 1/2, force one frequency via equal channels, off-band via a non-AIS channel number)."""
     ne_lon, ne_lat, sw_lon, sw_lat = bbox_around(vlat, vlon, half_deg)
     return _encode({'msg_type': 22, 'mmsi': src_mmsi,
                     'channel_a': channel_a, 'channel_b': channel_b,
-                    'power': power, 'addressed': 0,
+                    'power': power, 'txrx': txrx, 'addressed': 0,
                     'ne_lon': ne_lon, 'ne_lat': ne_lat,
                     'sw_lon': sw_lon, 'sw_lat': sw_lat})
 
@@ -209,6 +219,16 @@ if __name__ == '__main__':
         ("M22reg", m22_channel_regional(BASE, 42.35, -70.90, channel_a=2088, channel_b=2087),
          {'msg_type': 22, 'mmsi': BASE, 'addressed': False,
           'channel_a': 2088, 'channel_b': 2087}),
+        # single-channel: Tx A only (txrx=1) -- obedience collapses tx to one channel
+        ("M22txA", m22_channel(BASE, V, txrx=1),
+         {'msg_type': 22, 'mmsi': BASE, 'addressed': True, 'dest1': V, 'txrx': 1}),
+        # off-band retune: both channels a NON-AIS number (2078), addressed + regional
+        ("M22offband", m22_channel(BASE, V, channel_a=2078, channel_b=2078),
+         {'msg_type': 22, 'mmsi': BASE, 'addressed': True, 'dest1': V,
+          'channel_a': 2078, 'channel_b': 2078}),
+        ("M22offbandReg", m22_channel_regional(BASE, 42.35, -70.90, channel_a=2078, channel_b=2078),
+         {'msg_type': 22, 'mmsi': BASE, 'addressed': False,
+          'channel_a': 2078, 'channel_b': 2078}),
         ("M6", m6_addressed(BASE, V), {'msg_type': 6, 'mmsi': BASE, 'dest_mmsi': V}),
     ]
     all_ok = True
