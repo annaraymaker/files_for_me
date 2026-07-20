@@ -52,6 +52,18 @@ def badcks(body):
     """structurally valid but deliberately WRONG checksum -> the unit should reject it (-> $AINAK)."""
     return ("$" + body + "*00\r\n").encode()
 
+def _xorck(body):
+    c = 0
+    for ch in body:
+        c ^= ord(ch)
+    return f"{c:02X}"
+
+def aivdm(body, good_ck=True):
+    """An encapsulated '!'-sentence (AIVDM/AIVDO family) with a correct or deliberately wrong
+    checksum. body is the text between '!' and '*'."""
+    cs = _xorck(body) if good_ck else "00"
+    return f"!{body}*{cs}\r\n".encode()
+
 def spoof_field(payload):
     """a spoof-position RMC with `payload` spliced into the (otherwise empty) time field."""
     return f"GPRMC,1200{payload}00.00,A,{SPOOF_LAT_F},N,{SPOOF_LON_F},W,0.0,90.0,180626,,,A"
@@ -136,6 +148,35 @@ def build_probes(accept_config):
         (lambda: (b"\\s:$$**!!,c:1*00\\" + good(SPOOF_BODY))),
         note="tag block containing reserved chars")
 
+    # ---------- CONFORMANCE (targeted IEC 61162-1 receiver checks; run with --conform-only) ----------
+    # A 2-part encapsulated message. p1 is well formed; the second fragment is either broken or
+    # interrupted, which under IEC 61162-1 7.3.9 obliges the listener to DISCARD THE WHOLE message.
+    _p1 = "AIVDM,2,1,3,A,55P5TL01VIaAL@7WKO@mBplU@Tpl00000000000L0000000000000,0"
+    _p2 = "AIVDM,2,2,3,A,00000000000000000000000000000000000,0"
+    add("conform", "low", "conf_frag_badcks",
+        (lambda: aivdm(_p1, True) + aivdm(_p2, False)),
+        note="2-part message, part 2 has a BAD checksum -> whole message must be discarded (7.3.9)",
+        expect="reject")
+    add("conform", "low", "conf_frag_interrupt",
+        (lambda: aivdm(_p1, True) + good(SPOOF_BODY) + aivdm(_p2, True)),
+        note="2-part message interrupted by an unrelated sentence (non-contiguous) -> discard whole (7.3.9)",
+        smuggle=SPOOF, expect="reject")
+    add("conform", "low", "conf_frag_index_bad",
+        (lambda: aivdm("AIVDM,2,2,4,A,55P5TL01VIaAL@7WKO@mBplU@Tpl0000000,0", True)),
+        note="fragment 2 of a 2-part message with no part 1 (orphan fragment) -> must not be acted on",
+        expect="reject")
+    # Config-command semantics (7.3.7): a command must be flagged unambiguously; a null command
+    # field means no change. NOTE: the sentence formatter below is a PLACEHOLDER -- replace it with
+    # the unit's real config formatter per vendor before trusting a negative result.
+    add("conform", "low", "conf_cfg_no_c_flag",
+        (lambda: good("PAISCFG,RATE,5,R")),
+        note="PLACEHOLDER config sentence without the 'C' command flag (status R) -> must not change config",
+        expect="reject")
+    add("conform", "low", "conf_cfg_null_field",
+        (lambda: good("PAISCFG,RATE,,C")),
+        note="PLACEHOLDER config command with a NULL command field -> must be treated as no change",
+        expect="reject")
+
     # ---------- 4. CONFIG / PROPRIETARY (LAST, brick risk; opt-in) ----------
     if accept_config:
         add("config", "high", "prop_query_emt",
@@ -182,6 +223,9 @@ def main():
     ap.add_argument("--leak-repeat", type=int, default=6, help="times to repeat each leak probe")
     ap.add_argument("--liveness-secs", type=float, default=4.0)
     ap.add_argument("--only", nargs="+"); ap.add_argument("--skip-config", action="store_true")
+    ap.add_argument("--conform-only", action="store_true",
+                    help="run ONLY the targeted IEC 61162-1 conformance probes (multi-sentence "
+                         "reassembly + config-command semantics), skipping all other categories")
     ap.add_argument("--i-accept-config-risk", action="store_true",
                     help="include category 4 (config/proprietary) -- can change persistent state")
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -190,11 +234,13 @@ def main():
     args = ap.parse_args()
 
     probes = build_probes(args.i_accept_config_risk and not args.skip_config)
+    if args.conform_only:
+        probes = [p for p in probes if p["cat"] == "conform"]
     if args.only:
         probes = [p for p in probes if p["id"] in args.only]
-    # stable order: escape, leak, overflow/numeric/reassembly/tag, config LAST
+    # stable order: escape, leak, overflow/numeric/reassembly/tag, conform, config LAST
     catrank = {"escape": 0, "leak": 1, "overflow": 2, "numeric": 2, "reassembly": 2,
-               "tagblock": 2, "config": 9}
+               "tagblock": 2, "conform": 3, "config": 9}
     probes.sort(key=lambda p: catrank.get(p["cat"], 5))
 
     if args.dry_run:
