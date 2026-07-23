@@ -250,7 +250,7 @@ def encode_type20(src_mmsi, offset1=0, slots1=1, timeout1=7, increment1=0):
 
 def encode_type22(src_mmsi, channel_a=2087, channel_b=2088, tx_rx=0, power=0,
                  ne_lon=0, ne_lat=0, sw_lon=0, sw_lat=0, addressed=0,
-                 dest1=None, dest2=None):
+                 dest1=None, dest2=None, zonesize=0):
     """Type 22: channel management (force channel/power change -> channel-mgmt tests).
     Broadcast (regional) by default; set addressed=1 with dest1/dest2 to target a unit.
     168 bits.
@@ -285,7 +285,7 @@ def encode_type22(src_mmsi, channel_a=2087, channel_b=2088, tx_rx=0, power=0,
     b += _bits(addressed, 1)        # bit 139: addressed flag (both forms land here)
     b += _bits(0, 1)                # bit 140: Band A in use
     b += _bits(0, 1)                # bit 141: Band B in use
-    b += _bits(0, 3)                # bits 142-144: zone size
+    b += _bits(zonesize, 3)         # bits 142-144: transition zone size (NM); 1-8 valid
     b = (b + "0" * 168)[:168]
     assert len(b) == 168, f"Type 22 must be 168 bits, got {len(b)}"
     return b
