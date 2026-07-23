@@ -708,25 +708,21 @@ M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A
 
 
 def build_chanmgmt_switch(ctx):
-    """Minimal channel-switch test, to run ALONE (ideally with --clear-region). The unit LOCKS a
-    regional area after the first Msg 22 that sets one, and then ignores any later Msg 22 for that
-    area -- so the switch only takes if it is the FIRST regional command the unit sees. Sending the
-    power/Tx-Rx cells (also regional Msg 22, on the default channels) first plants a 87/88 area that
-    blocks the switch, which is exactly what happened in the full-suite run. So this builder is just
-    announce, then the regional switch to the alt channels: ship first (authority; expect ignored),
-    then base (expect the victim to leave AIS1/AIS2)."""
-    V = ctx.victim_mmsi
+    """EXACT replica of the sequence that vanished the unit in the first successful run: announce
+    the base as its OWN step, then send the base channel switch ALONE -- no Msg 4 in the same
+    burst, no ship command first, and (when run without --clear-region) no position jumping. The
+    transmitted Msg 22 is byte-identical to the one that worked (verified against that capture:
+    payload F03Owsj2B2D6f5QUVeGO31m1P000). Run on a CLEAN unit with no stored regional area; if the
+    unit already has a region, clear it via a front-panel factory reset, NOT with --clear-region,
+    because the position jump is one of the things that regressed the later runs."""
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
-    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
-          "Msg4 base-station announcement")
     return [
-        ("cm_announce_base", [m4]),
-        ("cm_m22_ship_altchan",
-            [m4, (_m22_regional(REGULAR_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
-                  f"M22 (ordinary ship) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect IGNORED")]),
+        ("cm_announce_base",
+            [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+              "Msg4 base-station announcement")]),
         ("cm_m22_base_altchan",
-            [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
-                  f"M22 (base) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect victim leaves AIS1/AIS2")]),
+            [(_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+              f"M22 (base) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect victim leaves AIS1/AIS2")]),
     ]
 
 
@@ -1287,7 +1283,11 @@ def main():
                 alt_ch=(ALT_CH_A, ALT_CH_B), def_ch=(DEF_CH_A, DEF_CH_B))
             for si, (seg_name, cells) in enumerate(segs):
                 do_clear_region(tag=f":{seg_name}")
-                time.sleep(20)   # let the fix re-settle at the cage position before commanding
+                # a jump back from 690 mi needs more than a moment for the unit to re-establish a
+                # stable fix and confirm it is inside the region before a regional command lands.
+                settle = max(60.0, args.settle)
+                print(f"    settling {settle:.0f}s at the cage position before commanding...")
+                time.sleep(settle)
                 rec(event="matrix_segment_start", name=seg_name, index=si)
                 print(f"\n=== SEGMENT {si+1}/{len(segs)}: {seg_name} "
                       f"({len(cells)} command{'s' if len(cells) != 1 else ''}) ===")
@@ -1303,6 +1303,12 @@ def main():
                     if ci < len(cells) - 1:
                         short = name.endswith(("release", "clear"))
                         time.sleep(8 if short else args.chanmgmt_gap)
+                # OBSERVATION dwell after the last command so its effect (rate change, power drop,
+                # single-channel, or the vanish) is visible on the witness BEFORE the next clear
+                # feeds a far position and undoes it. Without this the single-command segments only
+                # got an 8s window and nothing could be read.
+                print(f"    observing {args.chanmgmt_gap:.0f}s (watch the witness for the effect)...")
+                time.sleep(args.chanmgmt_gap)
                 rec(event="matrix_segment_end", name=seg_name)
             # final clear-region recovers the unit from the switch strand
             do_clear_region(tag=":final-recover")
