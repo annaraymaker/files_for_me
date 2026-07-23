@@ -478,12 +478,15 @@ def build_m20_suite(ctx):
     clean = (enc.encode_type4(BASE_MMSI, blat + 0.2, blon + 0.2, hour=12, minute=0, second=0),
              "clean control: base announced, no reservation")
     # 5-slot blocks; fraction of frame ~ 5/increment. increment values are spec-recommended.
+    # timeout1=1 (min) so a reservation clears within ~60 s and does NOT linger into the next
+    # control/test window -- otherwise reservations accumulate and the density ramp is confounded
+    # (as in the first M20 run, where the control windows stayed elevated).
     plan = [
-        ("base",    "d11", dict(offset1=0, slots1=5, timeout1=7, increment1=45), "5 of every 45 slots (~11% of frame)"),
-        ("base",    "d33", dict(offset1=0, slots1=5, timeout1=7, increment1=15), "5 of every 15 slots (~33% of frame)"),
-        ("base",    "d50", dict(offset1=0, slots1=5, timeout1=7, increment1=10), "5 of every 10 slots (~50% of frame)"),
-        ("base",    "d83", dict(offset1=0, slots1=5, timeout1=7, increment1=6),  "5 of every 6 slots (~83% of frame)"),
-        ("regular", "d50", dict(offset1=0, slots1=5, timeout1=7, increment1=10), "5 of every 10 slots (~50%) -- authority test"),
+        ("base",    "d11", dict(offset1=0, slots1=5, timeout1=1, increment1=45), "5 of every 45 slots (~11% of frame)"),
+        ("base",    "d33", dict(offset1=0, slots1=5, timeout1=1, increment1=15), "5 of every 15 slots (~33% of frame)"),
+        ("base",    "d50", dict(offset1=0, slots1=5, timeout1=1, increment1=10), "5 of every 10 slots (~50% of frame)"),
+        ("base",    "d83", dict(offset1=0, slots1=5, timeout1=1, increment1=6),  "5 of every 6 slots (~83% of frame)"),
+        ("regular", "d50", dict(offset1=0, slots1=5, timeout1=1, increment1=10), "5 of every 10 slots (~50%) -- authority test"),
     ]
     src_mmsi = {"base": BASE_MMSI, "regular": REGULAR_MMSI}
     cells = []
@@ -979,9 +982,9 @@ def main():
     ap.add_argument("--m20-only", action="store_true",
                     help="run ONLY the M20 slot-reservation suite (skip phases 1-3) so it can be "
                          "re-run on its own without repeating the whole session")
-    ap.add_argument("--m20-gap", type=float, default=35.0,
-                    help="dwell after each M20 cell (>= a few victim report cycles so the slot "
-                         "map re-settles and the reaction is visible)")
+    ap.add_argument("--m20-gap", type=float, default=90.0,
+                    help="dwell after each M20 cell (long, so each window has many victim reports "
+                         "at 2s cadence for a solid reselection statistic; >= a full frame)")
     ap.add_argument("--phase3-gap", type=float, default=90.0,
                     help="seconds of dwell after each phase-3 command (kept long so slow "
                          "effects like rate changes or retunes have time to appear)")
