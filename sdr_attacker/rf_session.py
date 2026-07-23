@@ -463,23 +463,33 @@ def build_phase3(ctx):
 # climbs. Each reservation cell is followed by a clean control cell (base announced, no
 # reservation) so the analyzer has a traffic-matched baseline right beside each test.
 def build_m20_suite(ctx):
-    V = ctx.victim_mmsi
+    """M20 slot-reservation density sweep, SPEC-LEGAL (M.1371-5 Table 72): a reservation block is
+    capped at 5 slots, so density is set by the increment field (fraction of frame ~ 5/increment),
+    not by oversized blocks (the old suite used 10-15, out of spec). Each reservation cell is
+    followed by a clean control (base announced, no reservation) for a traffic-matched baseline.
+    The runner drives the victim FAST so it reports every 2 s and its SOTDMA comm-state samples the
+    frame densely; analyze_m20_slots.py reads the victim's self-reported slot numbers from that
+    comm-state (transmitter-authoritative, no reception-jitter) and measures reselection/churn per
+    density. A unit that honours M20 must vacate an increasing share of the frame -> reselection
+    climbs with density; one that ignores it stays flat."""
     blat, blon = ctx.victim_lat, ctx.victim_lon
-    m4 = (p3enc.m4_base_report(BASE_MMSI, blat, blon), "M4: announce base station")
-    clean = (p3enc.m4_base_report(BASE_MMSI, blat, blon), "clean control: base announced, no reservation")
-    # (source, label, kwargs, human) -- density sweep from base, plus one dense from a regular ship
+    m4 = (enc.encode_type4(BASE_MMSI, blat + 0.2, blon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")
+    clean = (enc.encode_type4(BASE_MMSI, blat + 0.2, blon + 0.2, hour=12, minute=0, second=0),
+             "clean control: base announced, no reservation")
+    # 5-slot blocks; fraction of frame ~ 5/increment. increment values are spec-recommended.
     plan = [
-        ("base",    "small",     dict(offset=100, number=10, timeout=7, increment=0),  "10 slots, single block (~0.4% of frame)"),
-        ("base",    "half",      dict(offset=0,   number=10, timeout=7, increment=20), "10 of every 20 slots (~50% of frame)"),
-        ("base",    "dense",     dict(offset=0,   number=10, timeout=7, increment=15), "10 of every 15 slots (~67% of frame)"),
-        ("base",    "verydense", dict(offset=0,   number=15, timeout=7, increment=20), "15 of every 20 slots (~75% of frame)"),
-        ("regular", "dense",     dict(offset=0,   number=10, timeout=7, increment=15), "10 of every 15 slots (~67% of frame)"),
+        ("base",    "d11", dict(offset1=0, slots1=5, timeout1=7, increment1=45), "5 of every 45 slots (~11% of frame)"),
+        ("base",    "d33", dict(offset1=0, slots1=5, timeout1=7, increment1=15), "5 of every 15 slots (~33% of frame)"),
+        ("base",    "d50", dict(offset1=0, slots1=5, timeout1=7, increment1=10), "5 of every 10 slots (~50% of frame)"),
+        ("base",    "d83", dict(offset1=0, slots1=5, timeout1=7, increment1=6),  "5 of every 6 slots (~83% of frame)"),
+        ("regular", "d50", dict(offset1=0, slots1=5, timeout1=7, increment1=10), "5 of every 10 slots (~50%) -- authority test"),
     ]
     src_mmsi = {"base": BASE_MMSI, "regular": REGULAR_MMSI}
     cells = []
     for src, label, kw, human in plan:
         cells.append((f"m20_{src}_{label}",
-                      [m4, m4, (p3enc.m20_datalink(src_mmsi[src], **kw),
+                      [m4, m4, (enc.encode_type20(src_mmsi[src], **kw),
                                 f"[SRC={src.upper()}] M20 reserve {human}")]))
         cells.append((f"m20_recover_after_{src}_{label}", [m4, clean]))
     return cells
@@ -1210,6 +1220,17 @@ def main():
             print(f"\n=== M20 SUITE: {len(m20)} cells, {args.m20_gap}s dwell each "
                   f"(victim SOG={args.fast_speed}kn for dense sampling) ===")
             time.sleep(8)
+            # establish the base FIRMLY first (120 NM rule -- M20 requires the mobile to have
+            # received a Msg 4 from this base and computed it is within 120 NM before reserving).
+            m4b = enc.encode_type4(BASE_MMSI, ctx.victim_lat + 0.2, ctx.victim_lon + 0.2,
+                                   hour=12, minute=0, second=0)
+            print(f"    establishing base station: Msg 4 for {args.gentle_establish:.0f}s (120 NM rule)...")
+            rec(event="base_establish_start", seconds=args.gentle_establish, base_mmsi=BASE_MMSI)
+            _end = time.time() + args.gentle_establish
+            while time.time() < _end:
+                ws.send(m4b)
+                time.sleep(2)
+            rec(event="base_establish_end")
             # clean baseline-control window (no injection at all) for the traffic-matched reference
             rec(event="attack_begin", name="m20_baseline_control", index=-1, phase="M20:",
                 victim_lat=ctx.victim_lat, victim_lon=ctx.victim_lon, victim_speed=gps.speed)
