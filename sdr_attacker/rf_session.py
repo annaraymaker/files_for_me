@@ -923,10 +923,15 @@ def build_photos(ctx, photo_lat=None, photo_lon=None):
             [(enc.encode_type1(GHOST_A, glat, glon, sog=8.0, cog=270.0), "ghost position"),
              (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"), "name")],
             "GHOST VESSEL: a contact near own ship that does not exist"),
+        # Active AIS-SART pattern: a real SART in active mode sends a BURST of position reports
+        # (per IEC 61097-14 / M.1371 a group of position reports, not a single one), which is what a
+        # receiver correlates before it raises the SART distress alarm. A lone report every 2 s is
+        # received but often only listed as a target, not alarmed. So we send an 8-report burst each
+        # cycle to mimic the active SART and trip the distress display.
         "sart_distress": ("loop",
             [(enc.encode_type1(SAR_PREFIX, sp[0], sp[1], sog=0.0, nav_status=14),
-              "AIS-SART (970), distress nav-status 14")],
-            "FALSE DISTRESS: an AIS-SART locating-device contact, distress status"),
+              f"AIS-SART active burst {i + 1}/8") for i in range(8)],
+            "FALSE DISTRESS: active AIS-SART (970) sending an 8-report position burst, distress status"),
         "duplicate_mmsi": ("loop",
             [(enc.encode_type1(GHOST_DUP, vlat, vlon, sog=0.0), "MMSI at position A"),
              (enc.encode_type1(GHOST_DUP, db[0], db[1], sog=0.0), "same MMSI ~5 NM away")],
