@@ -966,7 +966,7 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
             [(enc.encode_type1(366200000 + i, la, lo, sog=0.0, cog=(i * 11) % 360),
               f"star vessel {i}")
              for i, (la, lo) in enumerate(
-                 star_outline(vlat, vlon, r, points=star_points, inner_ratio=0.4, per_edge=4))],
+                 star_outline(vlat, vlon, r, points=star_points, inner_ratio=0.4, per_edge=2))],
             f"STAR: ghost vessels tracing a {star_points}-point star around own ship "
             f"(radius {int(r)} m ~ {r/1852:.2f} NM; set the display range to about twice that)"),
         "m22_channel": ("hold",
@@ -1303,7 +1303,10 @@ def main():
                 reps = 0
                 while True:
                     _send_all()
-                    time.sleep(args.accept_cadence)
+                    # large sets are already paced by the per-message gap; the extra sleep only
+                    # slows how fast they re-report and thus how fast targets establish, so skip it.
+                    if _gap == 0:
+                        time.sleep(args.accept_cadence)
                     reps += 1
                     if reps % 30 == 0:
                         print(f"    ...still holding '{args.photo}' ({reps} reps), Ctrl-C to stop")
