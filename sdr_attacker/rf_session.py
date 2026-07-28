@@ -929,21 +929,24 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
     dbB = offset_position(vlat, vlon, 225, r * 0.7)    #   both within ~a mile but clearly separate
     m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
           "Msg4 base-station announcement")
+    # Distinct MMSI per photo so runs don't collide: e.g. after the Everest impossible_speed run
+    # the shared MMSI would still be pinned far away and a later forged_identity would not re-appear.
+    G_SPEED, G_IDENT, G_GHOST = 366000051, 366000055, 366000052
     return {
         "impossible_speed": ("loop",
-            [(enc.encode_type1(GHOST_A, glat, glon, sog=102.2, cog=90.0, nav_status=0),
+            [(enc.encode_type1(G_SPEED, glat, glon, sog=102.2, cog=90.0, nav_status=0),
               "ghost 102.2 kn, position fixed"),
-             (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"), "name")],
+             (enc.encode_type24_a(G_SPEED, shipname="GHOST VESSEL"), "name")],
             "IMPOSSIBLE SPEED: ghost at 102.2 kn with a fixed position "
             "(set --photo-lat/--photo-lon to an on-land point for the shot)"),
         "forged_identity": ("loop",
-            [(enc.encode_type24_a(GHOST_A, shipname="NOT REAL NAME"), "M24-A forged name"),
-             (enc.encode_type24_b(GHOST_A, callsign="FAKE1", shiptype=70), "M24-B forged call sign"),
-             (enc.encode_type1(GHOST_A, glat, glon, sog=6.0, cog=270.0), "M1 position")],
+            [(enc.encode_type24_a(G_IDENT, shipname="NOT REAL NAME"), "M24-A forged name"),
+             (enc.encode_type24_b(G_IDENT, callsign="FAKE1", shiptype=70), "M24-B forged call sign"),
+             (enc.encode_type1(G_IDENT, glat, glon, sog=6.0, cog=270.0), "M1 position")],
             "FORGED IDENTITY (Msg 24): name 'NOT REAL NAME', call sign 'FAKE1'"),
         "ghost_vessel": ("loop",
-            [(enc.encode_type1(GHOST_A, glat, glon, sog=8.0, cog=270.0), "ghost position"),
-             (enc.encode_type24_a(GHOST_A, shipname="GHOST VESSEL"), "name")],
+            [(enc.encode_type1(G_GHOST, glat, glon, sog=8.0, cog=270.0), "ghost position"),
+             (enc.encode_type24_a(G_GHOST, shipname="GHOST VESSEL"), "name")],
             "GHOST VESSEL: a contact near own ship that does not exist"),
         # Active AIS-SART pattern: a real SART in active mode sends a BURST of position reports
         # (per IEC 61097-14 / M.1371 a group of position reports, not a single one), which is what a
@@ -1282,10 +1285,15 @@ def main():
                 rec(event="photo_own_speed", speed=args.photo_own_speed)
                 print(f"  own-ship GPS feed set to {args.photo_own_speed} kn -- the unit itself now "
                       f"reports impossible speed while parked")
+            # space messages when there are many, so a large set (e.g. the star's ~40 vessels) does
+            # not transmit on top of itself and collide on air -- 0.1 s is ~4 TDMA slots apart.
+            _gap = 0.1 if len(payloads) > 4 else 0.0
             def _send_all():
                 for bits, meta in payloads:
                     if all(c in "01" for c in bits):
                         ws.send(bits)
+                        if _gap:
+                            time.sleep(_gap)
             print("\n" + "=" * 66)
             print(f"  PHOTO: {args.photo}")
             print(f"  >>> {banner}")
