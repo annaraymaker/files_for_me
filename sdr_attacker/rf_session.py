@@ -1310,10 +1310,21 @@ def main():
                     reps += 1
                     if reps % 30 == 0:
                         print(f"    ...still holding '{args.photo}' ({reps} reps), Ctrl-C to stop")
-            else:  # hold: fire the M22 state change, then hold for the front-panel shot
-                print("  Firing the command (needs a CLEAN unit)...")
+            else:  # hold: establish the base FIRST, then fire the M22, then hold for the panel shot
+                base_bits = payloads[0][0]     # payload[0] is the Msg 4 base announcement
+                cmd = payloads[1:]             # the M22 command(s)
+                print("  Establishing base (Msg 4) first so the unit will accept the command "
+                      "(needs a CLEAN unit)...")
+                _end = time.time() + 10
+                while time.time() < _end:
+                    ws.send(base_bits)
+                    time.sleep(1)
+                print("  Base established; sending the M22 command...")
                 for _ in range(6):
-                    _send_all()
+                    ws.send(base_bits)         # keep the base present alongside the command
+                    for bits, meta in cmd:
+                        if all(c in "01" for c in bits):
+                            ws.send(bits)
                     time.sleep(2)
                 print("  Applied. Photograph the FRONT PANEL now. Ctrl-C to stop.\n")
                 reps = 0
