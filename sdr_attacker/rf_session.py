@@ -1121,7 +1121,6 @@ def main():
     ap.add_argument("--photo-lon", type=float, default=None,
                     help="override the ghost target longitude for a photo")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
-    ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
     ap.add_argument("--i-confirm-cage-sealed", action="store_true")
