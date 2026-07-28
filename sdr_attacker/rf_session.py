@@ -891,20 +891,23 @@ def build_matrix_segments(ctx):
     ]
 
 
-def build_photos(ctx, photo_lat=None, photo_lon=None):
+def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0):
     """Fresh photo set. Each entry: name -> (kind, payloads, banner).
       kind 'loop'  -> a target injection re-sent forever so the contact stays on the display.
       kind 'hold'  -> an M22 state change fired a few times, then held so the FRONT PANEL can be
                       photographed (the unit keeps the changed state on its own).
-    RF payloads are (bits, meta) lists. For the ghost-based shots you can override the target
-    position with --photo-lat/--photo-lon (e.g. an on-land point); the default plots near own ship."""
+    RF payloads are (bits, meta) lists. Targets are placed photo_range metres from own ship (default
+    1000 m ~ 0.5 NM, so they sit within about a mile and read cleanly at a 1.5-3 NM display range).
+    Override the ghost position outright with --photo-lat/--photo-lon for an on-land shot."""
     V = ctx.victim_mmsi
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
-    dg = offset_position(vlat, vlon, 45, 4000)         # default ghost ~4 km NE (plots near own ship)
+    r = photo_range
+    dg = offset_position(vlat, vlon, 45, r)            # ghost ~r m NE of own ship
     glat = dg[0] if photo_lat is None else photo_lat
     glon = dg[1] if photo_lon is None else photo_lon
-    sp = offset_position(vlat, vlon, 90, 3000)
-    db = offset_position(vlat, vlon, 90, 9260)         # ~5 NM for the duplicate-identity shot
+    sp = offset_position(vlat, vlon, 90, r * 0.7)      # SART close to own ship
+    dbA = offset_position(vlat, vlon, 45, r * 0.7)     # duplicate copies straddle own ship,
+    dbB = offset_position(vlat, vlon, 225, r * 0.7)    #   both within ~a mile but clearly separate
     m4 = (enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
           "Msg4 base-station announcement")
     return {
@@ -933,9 +936,9 @@ def build_photos(ctx, photo_lat=None, photo_lon=None):
               f"AIS-SART active burst {i + 1}/8") for i in range(8)],
             "FALSE DISTRESS: active AIS-SART (970) sending an 8-report position burst, distress status"),
         "duplicate_mmsi": ("loop",
-            [(enc.encode_type1(GHOST_DUP, vlat, vlon, sog=0.0), "MMSI at position A"),
-             (enc.encode_type1(GHOST_DUP, db[0], db[1], sog=0.0), "same MMSI ~5 NM away")],
-            "DUPLICATE IDENTITY: one MMSI shown at two incompatible positions"),
+            [(enc.encode_type1(GHOST_DUP, dbA[0], dbA[1], sog=0.0), "MMSI at position A"),
+             (enc.encode_type1(GHOST_DUP, dbB[0], dbB[1], sog=0.0), "same MMSI, incompatible position")],
+            "DUPLICATE IDENTITY: one MMSI at two positions straddling own ship"),
         "m22_channel": ("hold",
             [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
                   f"M22 retune to {ALT_CH_A}/{ALT_CH_B}")],
@@ -1125,6 +1128,10 @@ def main():
                     help="override the ghost target latitude for a photo (e.g. an on-land point)")
     ap.add_argument("--photo-lon", type=float, default=None,
                     help="override the ghost target longitude for a photo")
+    ap.add_argument("--photo-range", type=float, default=1000.0,
+                    help="metres from own ship to place photo targets (default 1000 ~ 0.5 NM, within "
+                         "about a mile). Pair with a small display range (1.5-3 NM) so own ship and "
+                         "the target sit close together and clearly separate on the plot.")
     ap.add_argument("--photo-own-speed", type=float, default=None,
                     help="drive the UNIT'S OWN reported speed via its GPS feed to this many knots, so "
                          "the transponder itself reports an impossible speed while parked. Max useful "
@@ -1236,7 +1243,7 @@ def main():
     try:
         # ---- photo mode: play ONE attack forever so the display can be photographed ----
         if args.photo:
-            photos = build_photos(ctx, args.photo_lat, args.photo_lon)
+            photos = build_photos(ctx, args.photo_lat, args.photo_lon, args.photo_range)
             kind, payloads, banner = photos[args.photo]
             rec(event="photo_start", name=args.photo, kind=kind)
             if args.photo_own_speed is not None:
