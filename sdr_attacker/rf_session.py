@@ -128,6 +128,25 @@ def offset_position(lat, lon, bearing_deg, dist_m):
     return lat + dlat, lon + dlon
 
 
+def star_outline(vlat, vlon, radius_m, points=5, inner_ratio=0.4, per_edge=4):
+    """lat/lon points tracing the outline of an N-pointed star centered on (vlat,vlon). Outer
+    vertices sit at radius_m, inner vertices at radius_m*inner_ratio, and per_edge intermediate
+    points fill each edge so the shape reads as a star (not just scattered dots) on the chart."""
+    verts = []
+    for i in range(points * 2):
+        bearing = (360.0 / (points * 2)) * i
+        rad = radius_m if i % 2 == 0 else radius_m * inner_ratio
+        verts.append(offset_position(vlat, vlon, bearing, rad))
+    pts = []
+    for i in range(len(verts)):
+        a = verts[i]
+        b = verts[(i + 1) % len(verts)]
+        for k in range(per_edge):
+            f = k / per_edge
+            pts.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+    return pts
+
+
 # ----------------------------------------------------------------------------
 # The attack timeline. Each entry: (name, builder) where builder(ctx) -> list of
 # (payload_bits, meta). ctx gives access to the live victim position + config.
@@ -891,7 +910,7 @@ def build_matrix_segments(ctx):
     ]
 
 
-def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0):
+def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_points=5):
     """Fresh photo set. Each entry: name -> (kind, payloads, banner).
       kind 'loop'  -> a target injection re-sent forever so the contact stays on the display.
       kind 'hold'  -> an M22 state change fired a few times, then held so the FRONT PANEL can be
@@ -939,6 +958,14 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0):
             [(enc.encode_type1(GHOST_DUP, dbA[0], dbA[1], sog=0.0), "MMSI at position A"),
              (enc.encode_type1(GHOST_DUP, dbB[0], dbB[1], sog=0.0), "same MMSI, incompatible position")],
             "DUPLICATE IDENTITY: one MMSI at two positions straddling own ship"),
+        # many ghosts tracing a star outline around own ship -- purely for a striking chart image
+        "star": ("loop",
+            [(enc.encode_type1(366200000 + i, la, lo, sog=0.0, cog=(i * 11) % 360),
+              f"star vessel {i}")
+             for i, (la, lo) in enumerate(
+                 star_outline(vlat, vlon, r, points=star_points, inner_ratio=0.4, per_edge=4))],
+            f"STAR: ghost vessels tracing a {star_points}-point star around own ship "
+            f"(radius {int(r)} m ~ {r/1852:.2f} NM; set the display range to about twice that)"),
         "m22_channel": ("hold",
             [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
                   f"M22 retune to {ALT_CH_A}/{ALT_CH_B}")],
@@ -1119,7 +1146,8 @@ def main():
                     help="seconds to hold the far position so the unit runs its regional-area "
                          "housekeeping and deletes the out-of-range area")
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity", "ghost_vessel",
-                                        "sart_distress", "duplicate_mmsi", "m22_channel", "m22_power"],
+                                        "sart_distress", "duplicate_mmsi", "star",
+                                        "m22_channel", "m22_power"],
                     help="hold ONE shot for the camera (Ctrl-C to stop, restart for the next). "
                          "The target shots (ghost/speed/identity/distress/duplicate) loop forever so "
                          "the contact stays up; the m22_ shots fire the command then hold the unit in "
@@ -1128,6 +1156,8 @@ def main():
                     help="override the ghost target latitude for a photo (e.g. an on-land point)")
     ap.add_argument("--photo-lon", type=float, default=None,
                     help="override the ghost target longitude for a photo")
+    ap.add_argument("--photo-star-points", type=int, default=5,
+                    help="number of points on the --photo star (default 5)")
     ap.add_argument("--photo-range", type=float, default=1000.0,
                     help="metres from own ship to place photo targets (default 1000 ~ 0.5 NM, within "
                          "about a mile). Pair with a small display range (1.5-3 NM) so own ship and "
@@ -1243,7 +1273,8 @@ def main():
     try:
         # ---- photo mode: play ONE attack forever so the display can be photographed ----
         if args.photo:
-            photos = build_photos(ctx, args.photo_lat, args.photo_lon, args.photo_range)
+            photos = build_photos(ctx, args.photo_lat, args.photo_lon, args.photo_range,
+                                  args.photo_star_points)
             kind, payloads, banner = photos[args.photo]
             rec(event="photo_start", name=args.photo, kind=kind)
             if args.photo_own_speed is not None:
