@@ -989,12 +989,16 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
             f"(radius {int(r)} m ~ {r/1852:.2f} NM; set the display range to about twice that)"),
         # a swarm of active AIS-SARTs evenly filling a disc around own ship -- every one a distinct
         # 970 identity with distress status, so em-trak paints a solid circle of distress icons.
+        # Each SART emits a SHORT BURST (not one report): a lone report per 970 identity is received
+        # but not accepted onto the SART path, which is why the single-SART photo bursts one identity
+        # 8x. Here each of 18 identities fires a 4-report burst back-to-back so each is correlated.
         "sart_circle": ("loop",
             [(enc.encode_type1(970200000 + i, la, lo, sog=0.0, nav_status=14,
                                timestamp=time.gmtime().tm_sec),
-              f"SART {i}")
-             for i, (la, lo) in enumerate(disc_fill(vlat, vlon, r, n=28))],
-            f"SART CIRCLE: 28 active AIS-SARTs filling a disc around own ship "
+              f"SART {i} burst")
+             for i, (la, lo) in enumerate(disc_fill(vlat, vlon, r, n=18))
+             for _ in range(4)],
+            f"SART CIRCLE: 18 active AIS-SARTs (4-report bursts) filling a disc around own ship "
             f"(radius {int(r)} m ~ {r/1852:.2f} NM; set the display range to about twice that)"),
         "m22_channel": ("hold",
             [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
