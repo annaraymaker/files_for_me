@@ -953,8 +953,12 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
         # receiver correlates before it raises the SART distress alarm. A lone report every 2 s is
         # received but often only listed as a target, not alarmed. So we send an 8-report burst each
         # cycle to mimic the active SART and trip the distress display.
+        # timestamp MUST be a real UTC second (0-59), not the 60 "not available" default:
+        # em-trak still lists a no-timestamp SART, but Furuno's distress path treats a 970
+        # target without a valid fix-time as not a usable fix and will not raise it.
         "sart_distress": ("loop",
-            [(enc.encode_type1(SAR_PREFIX, sp[0], sp[1], sog=0.0, nav_status=14),
+            [(enc.encode_type1(SAR_PREFIX, sp[0], sp[1], sog=0.0, nav_status=14,
+                               timestamp=time.gmtime().tm_sec),
               f"AIS-SART active burst {i + 1}/8") for i in range(8)],
             "FALSE DISTRESS: active AIS-SART (970) sending an 8-report position burst, distress status"),
         "duplicate_mmsi": ("loop",
