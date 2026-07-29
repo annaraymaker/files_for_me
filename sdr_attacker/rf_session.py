@@ -1344,8 +1344,16 @@ def main():
             print("=" * 66)
             if kind == "loop":
                 print("  Looping the injection. Photograph the DISPLAY. Ctrl-C to stop.\n")
+                # SART targets carry a UTC-second timestamp that a receiver ages against its own
+                # clock; a frozen second (captured once at build) reads as a stale, non-advancing
+                # fix and the SART path drops it. So for the SART modes, rebuild the payloads each
+                # pass with the LIVE current second, the way a real active SART advances its stamp.
+                _live_sart = args.photo in ("sart_distress", "sart_circle")
                 reps = 0
                 while True:
+                    if _live_sart:
+                        payloads = build_photos(ctx, args.photo_lat, args.photo_lon,
+                                                args.photo_range, args.photo_star_points)[args.photo][1]
                     _send_all()
                     # large sets are already paced by the per-message gap; the extra sleep only
                     # slows how fast they re-report and thus how fast targets establish, so skip it.
