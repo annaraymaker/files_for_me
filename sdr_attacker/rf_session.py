@@ -1355,9 +1355,12 @@ def main():
                         payloads = build_photos(ctx, args.photo_lat, args.photo_lon,
                                                 args.photo_range, args.photo_star_points)[args.photo][1]
                     _send_all()
-                    # large sets are already paced by the per-message gap; the extra sleep only
-                    # slows how fast they re-report and thus how fast targets establish, so skip it.
-                    if _gap == 0:
+                    # A real AIS-SART transmits a BURST then a gap, and the receiver correlates the
+                    # group; continuous back-to-back reports with no gap defeat that. So the SART
+                    # modes always pause between bursts, even though they are large sets. Ordinary
+                    # ghost/star sets are paced by the per-message gap and want no extra pause (it
+                    # only slows how fast they establish), so those skip the sleep.
+                    if _gap == 0 or _live_sart:
                         time.sleep(args.accept_cadence)
                     reps += 1
                     if reps % 30 == 0:
