@@ -958,15 +958,19 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
     #     while you shoot. Own ship should run a lane course + realistic speed (the photo branch
     #     defaults these three modes to 12 kn / 000 deg). ---
     NM = 1852.0
-    # Congested-lane formation ahead of own ship (own ship heading ~north): plausible spacing,
-    # lane-consistent courses, one crosser on a converging track for a low-CPA collision alarm.
+    # Congested-lane formation designed as a TRAP (own ship heading ~north): the path ahead is
+    # blocked and the whole starboard side is walled off, so the COLREGs-correct move (alter to
+    # starboard, pass astern of the crossing vessel) is impossible and the only open water is to
+    # port -- point that gap at the hazard (shoal or opposing lane) in the caption. Plausible
+    # spacing and lane-consistent courses so it reads as real traffic.
     # (mmsi, bearing_from_own, dist_NM, sog, cog, name, shiptype)
     _traffic = [
-        (366310001,   0, 1.4,  4.0,   0, "NORDIC AURORA",  80),   # slow tanker mid-lane ahead
-        (366310002,   0, 0.8,  9.0,   0, "IRON DUKE",      70),   # cargo close ahead (blocks water)
-        (366310003, 345, 1.3, 11.0, 355, "BLUE HORIZON",   70),   # cargo ahead-port
-        (366310004,  15, 1.1, 12.0,   5, "PACIFIC TRADER", 70),   # cargo ahead-starboard
-        (366310005,  28, 1.2, 13.0, 282, "CAPE FELIX",     60),   # crosser, converging (low CPA)
+        (366310001,   0, 2.5,  4.0,   0, "NORDIC AURORA",  80),   # slow tanker: block dead ahead
+        (366310002,  10, 1.5,  9.0,   5, "IRON DUKE",      70),   # cargo: nearer block ahead
+        (366310003,  45, 2.2, 14.0, 300, "CAPE FELIX",     60),   # crosser from stbd bow (give-way, low CPA)
+        (366310004,  70, 2.8, 12.0,  20, "PACIFIC TRADER", 70),   # starboard wall (bow)
+        (366310005,  95, 3.4, 11.0, 355, "BALTIC TRADER",  70),   # starboard wall (beam)
+        (366310006, 120, 4.0, 10.0, 340, "STENA VISION",   70),   # starboard wall (quarter)
     ]
     _traffic_payloads = []
     for _m, _brg, _dnm, _sog, _cog, _nm, _st in _traffic:
@@ -1000,9 +1004,10 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
         # like real traffic, with one crosser on a converging track that trips the CPA/TCPA alarm
         # and forces a diversion. Nothing is individually implausible; the attack is the layout.
         "collision_traffic": ("loop", _traffic_payloads,
-            "PHANTOM TRAFFIC: five ghost vessels laid out as congested-lane traffic ahead of own "
-            "ship, one crosser on a converging track (low CPA). Run own ship on a lane course "
-            "(--photo-own-speed 12 --photo-own-course 0) at a 3-6 NM display range."),
+            "PHANTOM TRAFFIC: six ghost vessels blocking dead ahead and walling off the whole "
+            "starboard side, with a crosser on a converging track (low CPA). The only open water "
+            "is to port -- caption it pointing at the shoal or the opposing lane. Run own ship on "
+            "a lane course (--photo-own-speed 12 --photo-own-course 0) at a 6-8 NM display range."),
         # CASE STUDY 3 (search & rescue): ONE active AIS-SART at a believable distress distance
         # (~2.5 NM off the track), not a ring on top of own ship. Every vessel in range then owes
         # a SOLAS duty to divert, so a single fake beacon reroutes real ships.
