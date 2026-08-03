@@ -983,7 +983,11 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
         ]
     _lure = offset_position(vlat, vlon, 30, 2.5 * NM)    # SART at a believable distress distance
     _idpos = offset_position(vlat, vlon, 40, 1.2 * NM)   # laundered-identity ghost near the lane
-    G_LAUNDER = 366320007
+    # SYNTHETIC identity, corresponds to NO real vessel: a TEST MMSI under Liberia's MID (636), the
+    # classic dark-fleet flag of convenience, so the display reads as a Liberian-flagged tanker. This
+    # is the laundering profile documented reports describe (operators buy scrapped ships' MMSIs and
+    # reflag active tankers); we demonstrate on a fabricated identity and cite the real cases in text.
+    G_LAUNDER = 636000817
     return {
         "impossible_speed": ("loop",
             [(enc.encode_type1(G_SPEED, glat, glon, sog=102.2, cog=90.0, nav_status=0),
@@ -1020,13 +1024,15 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
         # CASE STUDY 4 (identity): ONE ghost carrying a full, credible forged profile presented by
         # the unit as authoritative. Photograph the target info box.
         "laundered_identity": ("loop",
-            [(enc.encode_type24_a(G_LAUNDER, shipname="ATLANTIC PROVIDENCE"), "forged name"),
-             (enc.encode_type24_b(G_LAUNDER, callsign="3EAB7", shiptype=70),
-              "forged call sign + cargo type"),
+            [(enc.encode_type24_a(G_LAUNDER, shipname="GULF SERENITY"), "forged name"),
+             (enc.encode_type24_b(G_LAUNDER, callsign="A8QK7", shiptype=80),
+              "forged call sign (Liberia format) + tanker type"),
              (enc.encode_type1(G_LAUNDER, _idpos[0], _idpos[1], sog=11.0, cog=210.0,
-                               heading=210, nav_status=0), "position")],
-            "LAUNDERED IDENTITY: a ghost presenting a complete plausible profile (name "
-            "'ATLANTIC PROVIDENCE', call sign '3EAB7', cargo). Photograph the target info box."),
+                               heading=210, nav_status=0), "laden-tanker position")],
+            "LAUNDERED IDENTITY: a fabricated Liberian-flagged tanker (name 'GULF SERENITY', call "
+            "sign 'A8QK7', MID 636), the flag-of-convenience dark-fleet profile. The unit presents "
+            "it as authoritative with no verification. Photograph the target info box; caption it "
+            "with the real dark-fleet identity-laundering cases."),
         # Active AIS-SART pattern: a real SART in active mode sends a BURST of position reports
         # (per IEC 61097-14 / M.1371 a group of position reports, not a single one), which is what a
         # receiver correlates before it raises the SART distress alarm. A lone report every 2 s is
