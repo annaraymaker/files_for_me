@@ -988,6 +988,14 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
     # is the laundering profile documented reports describe (operators buy scrapped ships' MMSIs and
     # reflag active tankers); we demonstrate on a fabricated identity and cite the real cases in text.
     G_LAUNDER = 636000817
+    # Hormuz "sensitive waters" incident: a SYNTHETIC flagged tanker (again a MID-636 test MMSI, no
+    # real vessel) whose false track shows it straying north out of the traffic lane toward Iranian
+    # territorial waters at the chokepoint. Own ship should be set at a Strait of Hormuz TSS position
+    # (~26.55 N, 56.40 E); the ghost is offset ~6 NM north-northeast, heading further into the
+    # sensitive zone. The kind of false track that, at a 20%-of-world-oil chokepoint, could drive an
+    # interception or escalation -- cite the real Hormuz spoofing incidents in the caption.
+    _hormuz = offset_position(vlat, vlon, 15, 6.0 * NM)
+    G_HORMUZ = 636000823
     return {
         "impossible_speed": ("loop",
             [(enc.encode_type1(G_SPEED, glat, glon, sog=102.2, cog=90.0, nav_status=0),
@@ -1033,6 +1041,19 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
             "sign 'A8QK7', MID 636), the flag-of-convenience dark-fleet profile. The unit presents "
             "it as authoritative with no verification. Photograph the target info box; caption it "
             "with the real dark-fleet identity-laundering cases."),
+        # SENSITIVE WATERS (Strait of Hormuz): a SYNTHETIC flagged tanker whose false track shows it
+        # deviating from the lane toward Iranian territorial waters at the chokepoint. No real vessel.
+        "hormuz_incident": ("loop",
+            [(enc.encode_type24_a(G_HORMUZ, shipname="GULF PIONEER"), "forged name"),
+             (enc.encode_type24_b(G_HORMUZ, callsign="A8RT4", shiptype=80),
+              "forged call sign (Liberia format) + tanker type"),
+             (enc.encode_type1(G_HORMUZ, _hormuz[0], _hormuz[1], sog=9.0, cog=20.0,
+                               heading=20, nav_status=0), "tanker deviating toward Iranian waters")],
+            "SENSITIVE WATERS (HORMUZ): a fabricated Liberian-flagged tanker 'GULF PIONEER' whose "
+            "spoofed track shows it straying north of the traffic lane toward Iranian territorial "
+            "waters at the chokepoint. Set own ship at a Hormuz TSS position (--lat 26.55 --lon "
+            "56.40), display range 10-12 NM. No real vessel; caption with the real Hormuz spoofing "
+            "incidents. Photograph the plot showing the deviation, or the target info box."),
         # Active AIS-SART pattern: a real SART in active mode sends a BURST of position reports
         # (per IEC 61097-14 / M.1371 a group of position reports, not a single one), which is what a
         # receiver correlates before it raises the SART distress alarm. A lone report every 2 s is
@@ -1259,7 +1280,7 @@ def main():
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity", "ghost_vessel",
                                         "sart_distress", "sart_circle", "duplicate_mmsi", "star",
                                         "collision_traffic", "distress_lure", "laundered_identity",
-                                        "m22_channel", "m22_power"],
+                                        "hormuz_incident", "m22_channel", "m22_power"],
                     help="hold ONE shot for the camera (Ctrl-C to stop, restart for the next). "
                          "The target shots (ghost/speed/identity/distress/duplicate) loop forever so "
                          "the contact stays up; the m22_ shots fire the command then hold the unit in "
@@ -1400,7 +1421,8 @@ def main():
             # set (pass Everest there to park own ship on the summit). Override or zero with the flags.
             # realistic case-study modes want own ship on a lane at a normal speed, not the
             # impossible-speed default used by the on-land shots.
-            _realistic = args.photo in ("collision_traffic", "distress_lure", "laundered_identity")
+            _realistic = args.photo in ("collision_traffic", "distress_lure", "laundered_identity",
+                                        "hormuz_incident")
             _def_speed, _def_course = (12.0, 0.0) if _realistic else (102.2, 279.0)
             own_speed = args.photo_own_speed if args.photo_own_speed is not None else _def_speed
             own_course = args.photo_own_course if args.photo_own_course is not None else _def_course
