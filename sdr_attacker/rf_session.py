@@ -952,6 +952,34 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
     # Distinct MMSI per photo so runs don't collide: e.g. after the Everest impossible_speed run
     # the shared MMSI would still be pinned far away and a later forged_identity would not re-appear.
     G_SPEED, G_IDENT, G_GHOST = 366000051, 366000055, 366000052
+
+    # --- realistic case-study scenarios: fixed positions (static-photographable) but each reports
+    #     a real speed and course, so the plotter draws live vectors and any CPA alarm holds steady
+    #     while you shoot. Own ship should run a lane course + realistic speed (the photo branch
+    #     defaults these three modes to 12 kn / 000 deg). ---
+    NM = 1852.0
+    # Congested-lane formation ahead of own ship (own ship heading ~north): plausible spacing,
+    # lane-consistent courses, one crosser on a converging track for a low-CPA collision alarm.
+    # (mmsi, bearing_from_own, dist_NM, sog, cog, name, shiptype)
+    _traffic = [
+        (366310001,   0, 1.4,  4.0,   0, "NORDIC AURORA",  80),   # slow tanker mid-lane ahead
+        (366310002,   0, 0.8,  9.0,   0, "IRON DUKE",      70),   # cargo close ahead (blocks water)
+        (366310003, 345, 1.3, 11.0, 355, "BLUE HORIZON",   70),   # cargo ahead-port
+        (366310004,  15, 1.1, 12.0,   5, "PACIFIC TRADER", 70),   # cargo ahead-starboard
+        (366310005,  28, 1.2, 13.0, 282, "CAPE FELIX",     60),   # crosser, converging (low CPA)
+    ]
+    _traffic_payloads = []
+    for _m, _brg, _dnm, _sog, _cog, _nm, _st in _traffic:
+        _la, _lo = offset_position(vlat, vlon, _brg, _dnm * NM)
+        _traffic_payloads += [
+            (enc.encode_type1(_m, _la, _lo, sog=_sog, cog=_cog, heading=int(_cog), nav_status=0),
+             f"{_nm} {_sog}kn {_cog}deg"),
+            (enc.encode_type24_a(_m, shipname=_nm), f"{_nm} name"),
+            (enc.encode_type24_b(_m, callsign="", shiptype=_st), f"{_nm} type"),
+        ]
+    _lure = offset_position(vlat, vlon, 30, 2.5 * NM)    # SART at a believable distress distance
+    _idpos = offset_position(vlat, vlon, 40, 1.2 * NM)   # laundered-identity ghost near the lane
+    G_LAUNDER = 366320007
     return {
         "impossible_speed": ("loop",
             [(enc.encode_type1(G_SPEED, glat, glon, sog=102.2, cog=90.0, nav_status=0),
@@ -968,6 +996,32 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
             [(enc.encode_type1(G_GHOST, glat, glon, sog=8.0, cog=270.0), "ghost position"),
              (enc.encode_type24_a(G_GHOST, shipname="GHOST VESSEL"), "name")],
             "GHOST VESSEL: a contact near own ship that does not exist"),
+        # CASE STUDY 1 (collision): a plausible congested-lane picture ahead of own ship, spaced
+        # like real traffic, with one crosser on a converging track that trips the CPA/TCPA alarm
+        # and forces a diversion. Nothing is individually implausible; the attack is the layout.
+        "collision_traffic": ("loop", _traffic_payloads,
+            "PHANTOM TRAFFIC: five ghost vessels laid out as congested-lane traffic ahead of own "
+            "ship, one crosser on a converging track (low CPA). Run own ship on a lane course "
+            "(--photo-own-speed 12 --photo-own-course 0) at a 3-6 NM display range."),
+        # CASE STUDY 3 (search & rescue): ONE active AIS-SART at a believable distress distance
+        # (~2.5 NM off the track), not a ring on top of own ship. Every vessel in range then owes
+        # a SOLAS duty to divert, so a single fake beacon reroutes real ships.
+        "distress_lure": ("loop",
+            [(enc.encode_type1(SAR_PREFIX, _lure[0], _lure[1], sog=0.0, nav_status=14,
+                               timestamp=time.gmtime().tm_sec), f"AIS-SART active burst {i + 1}/8")
+             for i in range(8)],
+            "FALSE DISTRESS: one active AIS-SART ~2.5 NM off own ship's track, distress status. "
+            "Photograph the SART ACTIVE target and the distress alert (em-trak / DY, not Furuno)."),
+        # CASE STUDY 4 (identity): ONE ghost carrying a full, credible forged profile presented by
+        # the unit as authoritative. Photograph the target info box.
+        "laundered_identity": ("loop",
+            [(enc.encode_type24_a(G_LAUNDER, shipname="ATLANTIC PROVIDENCE"), "forged name"),
+             (enc.encode_type24_b(G_LAUNDER, callsign="3EAB7", shiptype=70),
+              "forged call sign + cargo type"),
+             (enc.encode_type1(G_LAUNDER, _idpos[0], _idpos[1], sog=11.0, cog=210.0,
+                               heading=210, nav_status=0), "position")],
+            "LAUNDERED IDENTITY: a ghost presenting a complete plausible profile (name "
+            "'ATLANTIC PROVIDENCE', call sign '3EAB7', cargo). Photograph the target info box."),
         # Active AIS-SART pattern: a real SART in active mode sends a BURST of position reports
         # (per IEC 61097-14 / M.1371 a group of position reports, not a single one), which is what a
         # receiver correlates before it raises the SART distress alarm. A lone report every 2 s is
@@ -1193,6 +1247,7 @@ def main():
                          "housekeeping and deletes the out-of-range area")
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity", "ghost_vessel",
                                         "sart_distress", "sart_circle", "duplicate_mmsi", "star",
+                                        "collision_traffic", "distress_lure", "laundered_identity",
                                         "m22_channel", "m22_power"],
                     help="hold ONE shot for the camera (Ctrl-C to stop, restart for the next). "
                          "The target shots (ghost/speed/identity/distress/duplicate) loop forever so "
@@ -1332,8 +1387,12 @@ def main():
             # impossible speed (102.2 kn = the AIS SOG saturation) and a real course, so the unit
             # shows itself doing something no real vessel can. Own position is whatever --lat/--lon
             # set (pass Everest there to park own ship on the summit). Override or zero with the flags.
-            own_speed = args.photo_own_speed if args.photo_own_speed is not None else 102.2
-            own_course = args.photo_own_course if args.photo_own_course is not None else 279.0
+            # realistic case-study modes want own ship on a lane at a normal speed, not the
+            # impossible-speed default used by the on-land shots.
+            _realistic = args.photo in ("collision_traffic", "distress_lure", "laundered_identity")
+            _def_speed, _def_course = (12.0, 0.0) if _realistic else (102.2, 279.0)
+            own_speed = args.photo_own_speed if args.photo_own_speed is not None else _def_speed
+            own_course = args.photo_own_course if args.photo_own_course is not None else _def_course
             gps.set_position(ctx.victim_lat, ctx.victim_lon, speed=own_speed, course=own_course)
             rec(event="photo_own_state", speed=own_speed, course=own_course,
                 lat=ctx.victim_lat, lon=ctx.victim_lon)
@@ -1360,7 +1419,7 @@ def main():
                 # clock; a frozen second (captured once at build) reads as a stale, non-advancing
                 # fix and the SART path drops it. So for the SART modes, rebuild the payloads each
                 # pass with the LIVE current second, the way a real active SART advances its stamp.
-                _live_sart = args.photo in ("sart_distress", "sart_circle")
+                _live_sart = args.photo in ("sart_distress", "sart_circle", "distress_lure")
                 reps = 0
                 while True:
                     if _live_sart:
