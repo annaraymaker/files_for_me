@@ -996,6 +996,7 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
     # interception or escalation -- cite the real Hormuz spoofing incidents in the caption.
     _hormuz = offset_position(vlat, vlon, 15, 6.0 * NM)
     G_HORMUZ = 636000823
+    _aton = offset_position(vlat, vlon, 0, 1.5 * NM)   # phantom buoy ~1.5 NM dead ahead
     return {
         "impossible_speed": ("loop",
             [(enc.encode_type1(G_SPEED, glat, glon, sog=102.2, cog=90.0, nav_status=0),
@@ -1054,6 +1055,21 @@ def build_photos(ctx, photo_lat=None, photo_lon=None, photo_range=1000.0, star_p
             "waters at the chokepoint. Set own ship at a Hormuz TSS position (--lat 26.55 --lon "
             "56.40), display range 10-12 NM. No real vessel; caption with the real Hormuz spoofing "
             "incidents. Photograph the plot showing the deviation, or the target info box."),
+        # Message 14 (safety broadcast): single-slot, transmits fine -- check the RX-message popup.
+        "fake_safety": ("loop",
+            [(enc.encode_type14(366000060, text="SECURITE MINES AHEAD"), "M14 false safety text")],
+            "FALSE SAFETY BROADCAST (Msg 14): a forged safety text ('SECURITE MINES AHEAD') from an "
+            "ordinary MMSI. Single-slot, transmits fine. Watch the unit's received-message popup / "
+            "inbox (broadcast-provenance gap, same as Msg 8)."),
+        # Message 21 (AtoN): 272-bit 2-slot message -> will NOT transmit on the single-slot injector.
+        # Running it is the way to CONFIRM the limitation by eye: expect it to NOT appear.
+        "fake_aton": ("loop",
+            [(enc.encode_type21(992509999, name="SAFE WATER", lat=_aton[0], lon=_aton[1], virtual=1),
+              "M21 phantom virtual buoy")],
+            "PHANTOM AtoN (Msg 21): a virtual 'SAFE WATER' buoy ~1.5 NM dead ahead, luring toward a "
+            "hazard. Msg 21 is 2-slot (272 bits) so it will NOT transmit on the single-slot injector "
+            "(same limit as Msg 5). EXPECT nothing to appear -- that non-appearance is the documented "
+            "bench limitation, not a bug. Reaches the air only with a multi-slot injector."),
         # Active AIS-SART pattern: a real SART in active mode sends a BURST of position reports
         # (per IEC 61097-14 / M.1371 a group of position reports, not a single one), which is what a
         # receiver correlates before it raises the SART distress alarm. A lone report every 2 s is
@@ -1280,7 +1296,8 @@ def main():
     ap.add_argument("--photo", choices=["impossible_speed", "forged_identity", "ghost_vessel",
                                         "sart_distress", "sart_circle", "duplicate_mmsi", "star",
                                         "collision_traffic", "distress_lure", "laundered_identity",
-                                        "hormuz_incident", "m22_channel", "m22_power"],
+                                        "hormuz_incident", "fake_safety", "fake_aton",
+                                        "m22_channel", "m22_power"],
                     help="hold ONE shot for the camera (Ctrl-C to stop, restart for the next). "
                          "The target shots (ghost/speed/identity/distress/duplicate) loop forever so "
                          "the contact stays up; the m22_ shots fire the command then hold the unit in "

